@@ -1,0 +1,177 @@
+{# Macros compartidos por los informes #}
+{% macro bbch_chip(code) -%}
+{% if code is not none -%}
+<span class="chip" title="{{ macro_name(code) }}"><span class="sw" style="background: {{ macro_color(code) }}"></span>{{ code|bbch }}</span>
+{%- else -%}
+<span class="chip empty">Sin estado registrado</span>
+{%- endif %}
+{%- endmacro %}
+
+{% macro photo_pair(img) -%}
+{# Fotos opcionales: se muestran las que haya (canopia y/o detalle), sin casillas vacías. #}
+{% set n = (1 if img.canopy else 0) + (1 if img.detail else 0) %}
+{% if n == 0 %}<div class="photos one"><figure><div class="nophoto">Sin fotos</div></figure></div>
+{% else %}<div class="photos{{ ' one' if n == 1 else '' }}">
+  {% if img.canopy %}{{ photo(img.canopy, "Canopia") }}{% endif %}
+  {% if img.detail %}{{ photo(img.detail, "Detalle") }}{% endif %}
+</div>{% endif %}
+{%- endmacro %}
+
+{% macro photo(src, caption) -%}
+<figure>
+  {% if src %}<img src="{{ src }}" alt="{{ caption }}" loading="lazy">{% else %}<div class="nophoto">Sin foto</div>{% endif %}
+  <figcaption>{{ caption }}</figcaption>
+</figure>
+{%- endmacro %}
+
+{% macro geo_line(item) -%}
+{% if item.geo %}
+<div class="small muted geo">📍 <a href="{{ item.geo.link }}" target="_blank" rel="noopener">{{ item.geo.text }}</a>{% if item.geo.acc %} · ±{{ item.geo.acc|round|int }} m{% endif %}</div>
+{% endif %}
+{%- endmacro %}
+
+{% macro ai_line(item) -%}
+{% if item.ai_code is not none %}
+<div class="ai">Sugerencia IA: <strong>Estado {{ item.ai_code|code }}</strong>
+  {% if item.ai_conf is not none %}({{ (item.ai_conf * 100)|round|int }} % conf.){% endif %}
+  {% if item.ai_accepted == 1 %}<span class="tag">aceptada</span>{% elif item.ai_accepted == 0 %}<span class="tag">corregida</span>{% endif %}
+</div>
+{% endif %}
+{%- endmacro %}
+
+{% macro heatmap(heat, weeks, label="Variedad") -%}
+<div class="scroll-x">
+<table class="heat">
+  <thead><tr><th class="name">{{ label }}</th>
+  {% for w in weeks %}<th class="w" title="{{ w.label }}">{{ w|wks }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for r in heat %}
+  <tr><td class="name">{{ r.variety.name }}</td>
+    {% for c in r.cells %}
+      {% if c.code is not none %}{% set col = c.code|seq %}
+      <td class="c" style="background: {{ col[0] }}; color: {{ col[1] }}" title="{{ r.variety.name }} · {{ c.week|wk }} ({{ c.week.label }}) · {{ c.code|bbch }}">{{ c.code|code }}</td>
+      {% else %}<td class="c na" title="{{ r.variety.name }} · {{ c.week|wk }} · sin registro">·</td>{% endif %}
+    {% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<div class="legend-seq"><span>Estado 1</span><span class="bar"></span><span>Estado 11</span><span>· celda = estado registrado; «·» = sin registro</span></div>
+{%- endmacro %}
+
+{% macro compare_chart(cmp, uid) -%}
+{% if cmp %}
+<div class="cmp-wrap" id="{{ uid }}">
+  <div class="cmp-chips" role="group" aria-label="Variedades a comparar (máx. 4)">
+    {% for ch in cmp.chips %}
+    <button type="button" class="chip-s{% if ch.slot %} on s{{ ch.slot }}{% endif %}" data-id="{{ ch.id }}" aria-pressed="{{ 'true' if ch.slot else 'false' }}"><span class="key"></span>{{ ch.name }}</button>
+    {% endfor %}
+  </div>
+  <div class="cmp-fig card">
+    {{ cmp.svg|safe }}
+    <div class="cmp-tip" hidden></div>
+  </div>
+  <p class="small muted cmp-note">Toque una variedad para agregarla o quitarla de la comparación (máx. 4). En gris, el resto como referencia.</p>
+  <script type="application/json" class="cmp-data">{{ cmp.json|safe }}</script>
+</div>
+<script>
+(function () {
+  var root = document.getElementById("{{ uid }}");
+  if (!root) return;
+  var data = JSON.parse(root.querySelector(".cmp-data").textContent);
+  var svg = root.querySelector("svg.cmp"), tip = root.querySelector(".cmp-tip");
+  var slots = {};                     // id -> ranura de color (1..4), estable mientras siga elegida
+  root.querySelectorAll(".chip-s.on").forEach(function (b) {
+    slots[b.dataset.id] = +(b.className.match(/s(\d)/) || [0, 0])[1];
+  });
+  function free() { for (var s = 1; s <= 4; s++) { var used = false;
+      for (var k in slots) if (slots[k] === s) used = true; if (!used) return s; } return 0; }
+  function paint() {
+    root.querySelectorAll(".chip-s").forEach(function (b) {
+      var s = slots[b.dataset.id];
+      b.className = "chip-s" + (s ? " on s" + s : "");
+      b.setAttribute("aria-pressed", s ? "true" : "false");
+    });
+    svg.querySelectorAll("g.series").forEach(function (g) {
+      var s = slots[g.dataset.id];
+      g.setAttribute("class", "series " + (s ? "on s" + s : "off"));
+      if (s) g.parentNode.insertBefore(g, svg.querySelector(".xhair"));   // al frente
+    });
+  }
+  root.querySelectorAll(".chip-s").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var id = b.dataset.id;
+      if (slots[id]) { delete slots[id]; }
+      else { var s = free(); if (!s) return; slots[id] = s; }
+      paint();
+    });
+  });
+  var hit = svg.querySelector(".hit"), xh = svg.querySelector(".xhair");
+  function move(ev) {
+    var r = svg.getBoundingClientRect(), k = data.vw / r.width;
+    var px = (ev.clientX - r.left) * k;
+    var wk = Math.round(data.wmin + (px - data.pl) / data.w * (data.wmax - data.wmin));
+    wk = Math.max(data.wmin, Math.min(data.wmax, wk));
+    var xv = data.pl + (wk - data.wmin) / (data.wmax - data.wmin) * data.w;
+    xh.setAttribute("x1", xv); xh.setAttribute("x2", xv); xh.style.opacity = 1;
+    tip.textContent = "";
+    var head = document.createElement("div"); head.className = "t-h"; head.textContent = "Semana " + ((data.labels || {})[String(wk)] || wk); tip.appendChild(head);
+    var ids = Object.keys(slots);
+    if (!ids.length) ids = Object.keys(data.series);
+    ids.forEach(function (id) {
+      var s = data.series[id], v = s.pts[String(wk)];
+      if (v === undefined) return;
+      var row = document.createElement("div"); row.className = "t-r" + (slots[id] ? " s" + slots[id] : "");
+      var key = document.createElement("span"); key.className = "key"; row.appendChild(key);
+      var val = document.createElement("strong"); val.textContent = v % 1 ? "Posición " + v.toFixed(1).replace(".", ",") : "Estado " + v; row.appendChild(val);
+      var nm = document.createElement("span"); nm.textContent = " " + s.name; row.appendChild(nm);
+      tip.appendChild(row);
+    });
+    tip.hidden = false;
+    var fx = (xv / data.vw) * r.width;
+    tip.style.left = Math.min(r.width - 170, Math.max(0, fx + 12)) + "px";
+  }
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", function () { tip.hidden = true; xh.style.opacity = 0; });
+})();
+</script>
+{% endif %}
+{%- endmacro %}
+
+{% macro attach_gallery(items) -%}
+{% if items %}<div class="attach">{% for f in items %}
+  <figure><img src="{{ f.src }}" alt="{{ f.caption or 'Foto adjunta' }}" loading="lazy">
+  <figcaption>{{ f.caption or 'Foto adjunta' }}{% if f.when %}<span class="muted">{{ f.when }}</span>{% endif %}</figcaption></figure>
+{% endfor %}</div>{% endif %}
+{%- endmacro %}
+
+{% macro measures_block(measures, show_week=False, show_variety=True) -%}
+{% for m in measures %}
+<h3 class="measure">{{ m.name }} <span class="muted small">· {{ 'Planilla' if m.kind == 'table' else 'Imágenes' }}</span></h3>
+{% if m.kind == 'table' %}
+<div class="scroll-x"><table>
+  <thead><tr>{% if show_week %}<th>Semana</th>{% endif %}{% if show_variety %}<th>Variedad</th>{% endif %}{% for col in m.columns %}<th>{{ col }}</th>{% endfor %}</tr></thead>
+  <tbody>{% for r in m.rows %}<tr>{% if show_week %}<td>{{ r.week }}</td>{% endif %}{% if show_variety %}<td>{{ r.variety }}</td>{% endif %}{% for v in r['values'] %}<td class="mono">{{ v }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+</table></div>
+{% else %}
+{{ attach_gallery(m.pics) }}
+{% endif %}
+{% endfor %}
+{%- endmacro %}
+
+
+{% macro progress_block(progress) -%}
+{% if progress %}
+<h2>Mediciones · avance semanal</h2>
+<p class="muted small">Promedio de cada semana por variedad o sector. Avance = última semana − primera.</p>
+{% for p in progress %}{% if p.rows %}
+<h3 class="measure">{{ p.name }} <span class="muted small">· {{ p.variable }}</span></h3>
+<div class="scroll-x"><table>
+  <thead><tr><th>{{ p.who or 'Variedad' }}</th>{% for w in p.weeks %}<th>{{ w }}</th>{% endfor %}{% if p.advance %}<th>Avance</th>{% endif %}</tr></thead>
+  <tbody>{% for row in p.rows %}<tr><td><b>{{ row[0] }}</b></td>{% for v in row[1:] %}<td class="mono">{{ v }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+</table></div>
+{% endif %}{% endfor %}
+{% endif %}
+{%- endmacro %}

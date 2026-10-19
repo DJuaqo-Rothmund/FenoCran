@@ -1,0 +1,639 @@
+"""
+data_transfer.py
+================
+Copia de seguridad completa, restauración y rescate de datos de versiones anteriores.
+
+* `full_backup(db)`: ZIP con la base SQLite + todas las fotos + manifest.json.
+* `restore(db, path)`: acepta ese ZIP o el «.sqlite3» de «Respaldar base de datos»
+  (también el de versiones anteriores; el esquema se migra al abrirlo). Antes de
+  reemplazar se guarda una copia automática de los datos actuales.
+* `relink_photos(db)`: las fotos cuyo archivo ya no existe (p. ej. tras reinstalar)
+  se vuelven a enlazar con los originales de la carpeta pública «Imágenes de
+  Fenología», que se nombran «variedad_S03_detalle_AAAA-MM-DD_HHMMSS.jpg».
+* `import_reports(db, paths)`: lee informes semanales HTML/ZIP generados por la app
+  (variedad, estado fenológico, notas y fotos) y completa lo que falte.
+"""
+from __future__ import annotations
+
+import base64
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import zipfile
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
+
+import phenology as ph
+from android_bridge import PUBLIC_PHOTO_DIR, store_photo
+from platform_utils import IS_ANDROID, data_subdir, slugify
+
+KIND_LABEL = {"canopy": "canopia", "detail": "detalle"}
+DB_NAME = "fenocran.sqlite3"
+
+
+def _stamp() -> str:
+    return f"{_dt.datetime.now():%Y%m%d_%H%M%S}"
+
+
+def public_photo_dirs() -> list[str]:
+    if IS_ANDROID:
+        try:
+            from jnius import autoclass  # type: ignore
+            Environment = autoclass("android.os.Environment")
+            base = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_PICTURES).getAbsolutePath()
+        except Exception:  # noqa: BLE001
+            base = "/storage/emulated/0/Pictures"
+    else:
+        base = os.path.join(os.path.expanduser("~"), "Pictures")
+    # «FenoCran»: carpeta de las primeras versiones (fotos «FenoCran_AAAAMMDD_HHMMSS.jpg»).
+    return [os.path.join(base, PUBLIC_PHOTO_DIR), os.path.join(base, "FenoCran")]
+
+
+def _checkpoint_copy(db, dest: str) -> str:
+    with db._lock:
+        db.conn.commit()
+        out = sqlite3.connect(dest)
+        try:
+            db.conn.backup(out)
+        finally:
+            out.close()
+    return dest
+
+
+# ------------------------------------------------------------------ respaldo
+# Otras imágenes que viajan en la copia: (tabla, clave del manifiesto, carpeta en el ZIP)
+_EXTRA_IMAGES = (("variety_attachments", "attachments", "adjuntos"),
+                 ("measure_entries", "measures", "mediciones"))
+
+
+def _write_workspace(zf, db, prefix: str = "") -> int:
+    """Base + fotos de UN ensayo dentro del ZIP (bajo `prefix`). Devuelve n.º de fotos."""
+    tmp_db = _checkpoint_copy(db, os.path.join(data_subdir("tmp"), DB_NAME))
+    manifest = {"app": "FenoCran", "created": _dt.datetime.now().isoformat(timespec="seconds"),
+                "code": getattr(db, "code", ""), "photos": {}, "attachments": {}, "measures": {}}
+    zf.write(tmp_db, prefix + DB_NAME)
+    os.remove(tmp_db)
+    for r in db.query("SELECT id, path FROM photos"):
+        if os.path.exists(r["path"]):
+            arc = f"{prefix}fotos/{r['id']}_{os.path.basename(r['path'])}"
+            zf.write(r["path"], arc, compress_type=zipfile.ZIP_STORED)  # JPEG ya comprimido
+            manifest["photos"][str(r["id"])] = arc
+    for table, key, folder in _EXTRA_IMAGES:
+        for r in db.query(f"SELECT id, path FROM {table} WHERE path IS NOT NULL"):
+            if os.path.exists(r["path"]):
+                arc = f"{prefix}{folder}/{r['id']}_{os.path.basename(r['path'])}"
+                zf.write(r["path"], arc, compress_type=zipfile.ZIP_STORED)
+                manifest[key][str(r["id"])] = arc
+    zf.writestr(prefix + "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=1))
+    return len(manifest["photos"])
+
+
+def full_backup(db, dest_dir: str | None = None, workspaces=None, open_db=None) -> str:
+    """ZIP con la(s) base(s) y las fotos. Devuelve la ruta.
+
+    Con `workspaces` (registro de ensayos) el ZIP incluye TODO el teléfono: la base común
+    (IA, escala, ajustes) y cada ensayo/predio en «ensayos/<código>/». open_db(ws) abre
+    la base de un ensayo (por defecto workspaces.open)."""
+    dest_dir = dest_dir or data_subdir("backups")
+    path = os.path.join(dest_dir, f"FenoCran_respaldo_{_stamp()}.zip")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        if workspaces is None:
+            n = _write_workspace(zf, db)
+        else:
+            from workspaces import COMMON_DB
+            tmp = _checkpoint_copy(workspaces.shared, os.path.join(data_subdir("tmp"), COMMON_DB))
+            zf.write(tmp, COMMON_DB)
+            os.remove(tmp)
+            n, listed = 0, []
+            for ws in workspaces.list() + workspaces.list(archived=True):
+                wdb = (open_db or workspaces.open)(ws)
+                n += _write_workspace(zf, wdb, f"ensayos/{ws['code']}/")
+                listed.append({k: ws[k] for k in ("code", "name", "profile", "kind")})
+            zf.writestr("manifest.json", json.dumps(
+                {"app": "FenoCran", "kind": "multi", "workspaces": listed,
+                 "created": _dt.datetime.now().isoformat(timespec="seconds")},
+                ensure_ascii=False, indent=1))
+    db.log("backup", "full", None, f"{os.path.basename(path)} · {n} fotos")
+    return path
+
+
+# -------------------------------------------------------------- restauración
+@dataclass
+class RestoreResult:
+    observations: int = 0
+    photos: int = 0
+    photos_restored: int = 0      # desde el ZIP
+    photos_relinked: int = 0      # desde «Imágenes de Fenología»
+    photos_missing: int = 0
+    safety_copy: str = ""
+    missing: list = field(default_factory=list)
+
+    def summary(self) -> str:
+        parts = [f"{self.observations} registros", f"{self.photos} fotos en la base"]
+        if self.photos_restored:
+            parts.append(f"{self.photos_restored} fotos restauradas del respaldo")
+        if self.photos_relinked:
+            parts.append(f"{self.photos_relinked} recuperadas de la carpeta de fotos del teléfono")
+        if self.photos_missing:
+            parts.append(f"{self.photos_missing} sin archivo")
+        return " · ".join(parts)
+
+
+def _validate(path: str) -> None:
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        con.close()
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("El archivo no es una base de datos válida") from exc
+    if not {"varieties", "observations", "photos"} <= names:
+        raise ValueError("El archivo no es un respaldo de FenoCran")
+
+
+def restore(db, path: str, progress=None, workspaces=None, open_db=None) -> RestoreResult:
+    """Reemplaza los datos actuales por los del respaldo (.zip o .sqlite3).
+
+    Respaldo completo (con «comun.sqlite3» y `workspaces`): se restauran TODOS los ensayos
+    y la base común. Respaldo de una sola base (versiones anteriores): se restaura en el
+    ensayo actual y su memoria de la IA se suma a la común."""
+    tmp = data_subdir("tmp", "restore")
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as zf:
+            if workspaces is not None and "comun.sqlite3" in zf.namelist():
+                return _restore_all(db, zf, workspaces, open_db or workspaces.open, progress)
+            names = zf.namelist()
+            db_name = next((n for n in names if n.endswith((".sqlite3", ".db"))), None)
+            if db_name is None:
+                raise ValueError("El ZIP no contiene una base de datos (use «Importar informes» "
+                                 "para informes)")
+            src = os.path.join(tmp, "restore.sqlite3")
+            with open(src, "wb") as f:
+                f.write(zf.read(db_name))
+            full = json.loads(zf.read("manifest.json")) if "manifest.json" in names else {}
+            return _restore_into(db, src, zf, full, progress)
+    return _restore_into(db, path, None, {}, progress)
+
+
+def _restore_all(db, zf, workspaces, open_db, progress) -> RestoreResult:
+    from workspaces import COMMON_DB, SCHEMA
+    shared = workspaces.shared
+    keep = {k: shared.get_setting(k) for k in ("drive_enabled", "drive_wifi_only", "drive_status",
+                                              "drive_folders") if shared.get_setting(k) is not None}
+    src = os.path.join(data_subdir("tmp", "restore"), COMMON_DB)
+    with open(src, "wb") as f:
+        f.write(zf.read(COMMON_DB))
+    _checkpoint_copy(shared, os.path.join(data_subdir("backups"), f"antes_de_restaurar_comun_{_stamp()}.sqlite3"))
+    with shared._lock:
+        s = sqlite3.connect(src)
+        try:
+            s.backup(shared.conn)
+        finally:
+            s.close()
+        shared.init_schema()
+        shared.conn.executescript(SCHEMA)
+    for k, v in keep.items():
+        shared.set_setting(k, v)
+    total = RestoreResult()
+    for ws in workspaces.list() + workspaces.list(archived=True):
+        prefix = f"ensayos/{ws['code']}/"
+        if prefix + DB_NAME not in zf.namelist():
+            continue
+        wsrc = os.path.join(data_subdir("tmp", "restore"), f"{ws['code']}.sqlite3")
+        with open(wsrc, "wb") as f:
+            f.write(zf.read(prefix + DB_NAME))
+        man = json.loads(zf.read(prefix + "manifest.json")) if prefix + "manifest.json" in zf.namelist() else {}
+        r = _restore_into(open_db(ws), wsrc, zf, man, progress, migrate_ai=False)
+        total.observations += r.observations
+        total.photos += r.photos
+        total.photos_restored += r.photos_restored
+        total.photos_relinked += r.photos_relinked
+        total.photos_missing += r.photos_missing
+        total.missing += [f"{ws['code']} · {m}" for m in r.missing]
+        total.safety_copy = total.safety_copy or r.safety_copy
+    return total
+
+
+def _restore_into(db, src: str, zf, full: dict, progress=None, migrate_ai: bool = True) -> RestoreResult:
+    """Restaura una base (archivo `src`) y sus fotos (del ZIP, según el manifiesto) en `db`."""
+    manifest = full.get("photos", {})
+    extra = {key: full.get(key, {}) for _t, key, _f in _EXTRA_IMAGES}
+    _validate(src)
+    res = RestoreResult()
+    res.safety_copy = _checkpoint_copy(
+        db, os.path.join(data_subdir("backups"), f"antes_de_restaurar_{_stamp()}.sqlite3"))
+    # Se conserva la conexión a Drive del teléfono actual.
+    keep = {k: db.get_setting(k) for k in ("drive_enabled", "drive_wifi_only", "drive_status",
+                                          "drive_folders") if db.get_setting(k) is not None}
+    with db._lock:
+        s = sqlite3.connect(src)
+        try:
+            s.backup(db.conn)
+        finally:
+            s.close()
+        db.conn.execute("PRAGMA foreign_keys = ON")
+        db.init_schema()   # migra respaldos de versiones anteriores
+    for k, v in keep.items():
+        db.set_setting(k, v)
+
+    rows = db.query("SELECT id, path FROM photos")
+    for i, r in enumerate(rows):
+        if progress:
+            progress(i, len(rows))
+        arc = manifest.get(str(r["id"]))
+        if zf is not None and arc and not os.path.exists(r["path"]):
+            dest = os.path.join(data_subdir("photos", "restauradas"), os.path.basename(arc))
+            with zf.open(arc) as fin, open(dest, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            _set_path(db, r["id"], dest)
+            res.photos_restored += 1
+    for table, key, folder in _EXTRA_IMAGES:
+        for r in db.query(f"SELECT id, path FROM {table} WHERE path IS NOT NULL"):
+            arc = extra.get(key, {}).get(str(r["id"]))
+            if zf is not None and arc and not os.path.exists(r["path"]):
+                dest = os.path.join(data_subdir("photos", folder), os.path.basename(arc))
+                with zf.open(arc) as fin, open(dest, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+                db.execute(f"UPDATE {table} SET path=? WHERE id=?", (dest, r["id"]))
+    rel = relink_photos(db)
+    res.photos_relinked, res.photos_missing, res.missing = rel["relinked"], rel["missing"], rel["items"]
+    res.observations = db.query_one("SELECT COUNT(*) AS n FROM observations")["n"]
+    res.photos = len(rows)
+    if migrate_ai and getattr(db, "shared", None) is not None:
+        # Respaldo de una sola base (versiones anteriores): su memoria de la IA se suma.
+        from workspaces import migrate_ai_to_shared
+        migrate_ai_to_shared(db, db.shared, db.code)
+    db.log("restore", "database", None, res.summary())
+    return res
+
+
+def _set_path(db, photo_id: int, path: str) -> None:
+    db.execute("UPDATE photos SET path=? WHERE id=?", (path, photo_id))
+    db.ai_db.execute("UPDATE ai_references SET image_path=? WHERE photo_id=? "
+                     "AND COALESCE(workspace, '')=?", (path, photo_id, db.code))
+
+
+# ------------------------------------------------------- reenlazar originales
+_NAME_RE = re.compile(r"^(?P<prefix>.+_S\d{2}_(?:canopia|detalle))_(?P<stamp>\d{4}-\d{2}-\d{2}_\d{6})\.jpe?g$",
+                      re.IGNORECASE)
+
+
+# Nombres sin variedad (primeras versiones o cámara sin datos del registro): solo la hora.
+_TIME_RES = [(re.compile(r"^FenoCran_(\d{8}_\d{6})\.jpe?g$", re.I), "%Y%m%d_%H%M%S"),
+             (re.compile(r"^FenoCran_(\d{4}-\d{2}-\d{2}_\d{6})\.jpe?g$", re.I), "%Y-%m-%d_%H%M%S")]
+# La foto se nombra al abrir la cámara y el registro se guarda al volver de ella.
+TIME_WINDOW_BEFORE = _dt.timedelta(minutes=20)
+TIME_WINDOW_AFTER = _dt.timedelta(minutes=2)
+
+
+# Nombre «20260928-C11G.jpg» (o el anterior «28092026-C11G.jpg»; «-2», «-3»… o « (1)»
+# si Android lo duplicó).
+_DATED_RE = re.compile(r"^(?P<key>\d{8}-(?:[A-Z0-9]{2,4}-)?[A-Za-z0-9]+[GD])(?:-(?P<seq>\d+))?(?: \((?P<dup>\d+)\))?\.jpe?g$",
+                       re.IGNORECASE)
+
+
+def _scan_public(dirs: list[str]):
+    index: dict[str, list] = {}
+    dated: dict[str, list] = {}
+    timed: list[tuple[_dt.datetime, str]] = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            m = _DATED_RE.match(name)
+            if m:
+                order = (int(m["seq"] or 1), int(m["dup"] or 0))
+                dated.setdefault(m["key"].lower(), []).append((order, os.path.join(d, name)))
+                continue
+            m = _NAME_RE.match(name)
+            if m:
+                when = _dt.datetime.strptime(m["stamp"], "%Y-%m-%d_%H%M%S")
+                index.setdefault(m["prefix"].lower(), []).append((when, os.path.join(d, name)))
+                continue
+            for rx, fmt in _TIME_RES:
+                t = rx.match(name)
+                if t:
+                    timed.append((_dt.datetime.strptime(t[1], fmt), os.path.join(d, name)))
+                    break
+    for v in dated.values():
+        v.sort()
+    return index, dated, timed
+
+
+def _when(text) -> _dt.datetime | None:
+    try:
+        return _dt.datetime.fromisoformat((text or "")[:19])
+    except ValueError:
+        return None
+
+
+def relink_photos(db, dirs: list[str] | None = None) -> dict:
+    """Vuelve a enlazar fotos sin archivo con los originales de la carpeta pública."""
+    index, dated, timed = _scan_public(dirs if dirs is not None else public_photo_dirs())
+    used: set[str] = set()
+    relinked = missing = 0
+    items = []
+    rows = db.query(
+        "SELECT p.id, p.path, p.kind, p.source, p.captured_at, v.name AS variety, v.code AS vcode, "
+        "v.sector AS vsector, v.irrigation AS virrigation, "
+        "w.week_number, w.season, w.start_date "
+        "FROM photos p JOIN observations o ON o.id = p.observation_id "
+        "JOIN varieties v ON v.id = o.variety_id JOIN sampling_weeks w ON w.id = o.week_id "
+        "ORDER BY p.id")
+
+    def base_name(r, legacy=False, trial=None):
+        return ph.photo_basename({"name": r["variety"], "code": r["vcode"], "sector": r["vsector"],
+                                  "irrigation": r["virrigation"]}, r["start_date"], r["kind"],
+                                 legacy=legacy, trial=db.code if trial is None else trial)
+
+    def link(r, src):
+        used.add(src)
+        dest_dir = data_subdir("photos", f"T{r['season']}", f"S{r['week_number']:02d}")
+        _set_path(db, r["id"], store_photo(src, dest_dir, base_name(r), exact=True))
+
+    pending = []
+    for r in rows:
+        if os.path.exists(r["path"]):
+            continue
+        # 1) Nombre «20260928-C11G» (fecha de la semana + variedad + G/D), o el de las
+        #    versiones hasta la 1.1.30 con la fecha al revés: «28092026-C11G».
+        keys = (base_name(r), base_name(r, trial=""), base_name(r, legacy=True, trial=""))
+        cands = [c for key in dict.fromkeys(keys)
+                 for c in dated.get(key.lower(), []) if c[1] not in used]
+        if cands:
+            link(r, cands[0][1])
+            relinked += 1
+            continue
+        # 2) Nombre descriptivo «variedad_S03_detalle_fecha» (versiones de septiembre).
+        prefix = f"{slugify(r['variety'])}_S{r['week_number']:02d}_{KIND_LABEL.get(r['kind'], r['kind'])}"
+        cands = [c for c in index.get(prefix.lower(), []) if c[1] not in used]
+        if cands:
+            ref = _when(r["captured_at"])
+            link(r, min(cands, key=lambda c: abs((c[0] - ref).total_seconds()) if ref else 0)[1])
+            relinked += 1
+        else:
+            pending.append(r)
+    # 3) Solo fecha y hora (primeras versiones): la foto de cámara más cercana antes de
+    #    guardarse el registro; se asignan primero las parejas más cercanas.
+    pairs = []
+    for r in pending:
+        ref = _when(r["captured_at"])
+        if ref is None or (r["source"] or "camera") != "camera":
+            continue
+        for when, path in timed:
+            if ref - TIME_WINDOW_BEFORE <= when <= ref + TIME_WINDOW_AFTER:
+                pairs.append((abs((ref - when).total_seconds()), r["id"], path))
+    done_rows: set[int] = set()
+    by_id = {r["id"]: r for r in pending}
+    for _gap, rid, path in sorted(pairs):
+        if rid in done_rows or path in used:
+            continue
+        link(by_id[rid], path)
+        done_rows.add(rid)
+        relinked += 1
+    for r in pending:
+        if r["id"] not in done_rows:
+            missing += 1
+            items.append(f"{r['variety']} · S{r['week_number']} · {KIND_LABEL.get(r['kind'], r['kind'])}")
+    return {"relinked": relinked, "missing": missing, "items": items}
+
+
+# --------------------------------------------------- informes semanales (HTML)
+class _WeeklyParser(HTMLParser):
+    """Extrae semana, temporada y tarjetas por variedad de un informe semanal."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.h1 = ""
+        self.sub = ""
+        self.cards: list[dict] = []
+        self._stack: list[str] = []
+        self._card = None
+        self._grab = None   # "h1" | "sub" | "h3" | "chip" | "notes"
+        self._depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        cls = (a.get("class") or "").split()
+        if tag == "article" and "vcard" in cls:
+            self._card = {"name": "", "chip": "", "notes": "", "photos": {}}
+            self.cards.append(self._card)
+        elif tag == "h1":
+            self._grab = "h1"
+        elif tag == "div" and "sub" in cls and not self.sub and self._card is None:
+            self._grab = "sub"
+        elif self._card is not None:
+            if tag == "h3":
+                self._grab = "h3"
+            elif tag == "span" and "chip" in cls and not self._card["chip"]:
+                self._grab, self._depth = "chip", 0
+            elif tag == "div" and "notes" in cls:
+                self._grab = "notes"
+            elif tag == "img" and a.get("alt") in ("Canopia", "Detalle"):
+                kind = "canopy" if a["alt"] == "Canopia" else "detail"
+                self._card["photos"].setdefault(kind, a.get("src") or "")
+        if self._grab == "chip" and tag == "span":
+            self._depth += 1
+
+    def handle_endtag(self, tag):
+        if tag == "article":
+            self._card = None
+        if self._grab == "chip" and tag == "span":
+            self._depth -= 1
+            if self._depth <= 0:
+                self._grab = None
+        elif self._grab in ("h1", "h3") and tag in ("h1", "h3"):
+            self._grab = None
+        elif self._grab in ("sub", "notes") and tag == "div":
+            self._grab = None
+
+    def handle_data(self, data):
+        g = self._grab
+        if g == "h1":
+            self.h1 += data
+        elif g == "sub":
+            self.sub += data
+        elif g == "h3" and self._card is not None:
+            self._card["name"] += data
+        elif g == "chip" and self._card is not None:
+            self._card["chip"] += data
+        elif g == "notes" and self._card is not None:
+            self._card["notes"] += data
+
+
+@dataclass
+class ReportImport:
+    reports: int = 0
+    observations: int = 0
+    bbch: int = 0
+    photos: int = 0
+    skipped: list = field(default_factory=list)
+
+    def summary(self) -> str:
+        s = (f"{self.reports} informes · {self.observations} registros · {self.bbch} estados fenológicos · "
+             f"{self.photos} fotos")
+        if self.skipped:
+            s += f" · {len(self.skipped)} omitidos"
+        return s
+
+
+def _report_sources(path: str) -> list[tuple[str, str, zipfile.ZipFile | None]]:
+    """[(nombre, html, zip)] de un .html o de un .zip (informe empaquetado o varios)."""
+    if zipfile.is_zipfile(path):
+        zf = zipfile.ZipFile(path)
+        out = []
+        for n in zf.namelist():
+            if n.lower().endswith((".html", ".htm")):
+                out.append((n, zf.read(n).decode("utf-8", "replace"), zf))
+            elif n.lower().endswith(".zip"):  # ZIP de ZIPs
+                inner = os.path.join(data_subdir("tmp", "restore"), os.path.basename(n))
+                with open(inner, "wb") as f:
+                    f.write(zf.read(n))
+                out += _report_sources(inner)
+        return out
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [(os.path.basename(path), f.read(), None)]
+
+
+def _image_bytes(src: str, zf, html_name: str) -> bytes | None:
+    if src.startswith("data:"):
+        try:
+            return base64.b64decode(src.split(",", 1)[1])
+        except Exception:  # noqa: BLE001
+            return None
+    if zf is not None and src:
+        base = os.path.dirname(html_name)
+        for cand in (os.path.normpath(os.path.join(base, src)).replace("\\", "/"), src):
+            try:
+                return zf.read(cand)
+            except KeyError:
+                continue
+    return None
+
+
+def _pdf_week_report(path: str):
+    """Datos de un informe semanal en PDF (archivo «fenocran_semanal.json» incrustado)
+    y acceso a sus fotos (imágenes JPEG del PDF, por nombre)."""
+    from pypdf import PdfReader
+    from pdf_report import WEEKLY_DATA
+    try:
+        reader = PdfReader(path)
+        raw = reader.attachments.get(WEEKLY_DATA)
+    except Exception:  # noqa: BLE001 - PDF dañado o de otra aplicación
+        return None, {}
+    if not raw:
+        return None, {}
+    data = json.loads(raw[0])
+    images = {}
+    for page in reader.pages:
+        xobjects = (page.get("/Resources") or {}).get("/XObject") or {}
+        for key, ref in xobjects.items():
+            images.setdefault(str(key).lstrip("/"), ref)
+    return data, images
+
+
+def _parse_sources(db, paths: list[str]):
+    """Informes semanales (HTML, ZIP o PDF) -> [(nombre, semana | None, tarjetas)].
+    Tarjeta: {name, code, notes, photos: {tipo: función que devuelve los bytes}}."""
+    out = []
+    for p in paths:
+        if p.lower().endswith(".pdf"):
+            data, images = _pdf_week_report(p)
+            week, cards = None, []
+            if data and data.get("kind") == "weekly":
+                try:
+                    week = db.week_for_date(_dt.date.fromisocalendar(
+                        int(data["iso_year"]), int(data["iso_week"]), 7))
+                except (KeyError, ValueError):
+                    week = None
+                for c in data.get("cards", []):
+                    photos = {k: (lambda ref=images.get(n): ref.get_object().get_data() if ref else None)
+                              for k, n in (c.get("photos") or {}).items()}
+                    cards.append({"name": c.get("name", ""), "code": c.get("bbch"),
+                                  "notes": c.get("notes") or "", "photos": photos})
+            out.append((os.path.basename(p), week if cards else None, cards))
+            continue
+        for name, html, zf in _report_sources(p):
+            parser = _WeeklyParser()
+            parser.feed(html)
+            wk = re.search(r"Semana\s+(\d+)", parser.h1)
+            year = re.search(r"año\s+(\d{4})", parser.h1, flags=re.I)      # «Semana 37, año 2026»
+            season = re.search(r"Temporada\s+(\d{4})", parser.sub)         # formato anterior
+            week = None
+            if "semanal" in parser.h1.lower() and wk and parser.cards:
+                if year:
+                    try:   # domingo de esa semana ISO: siempre cae dentro de la semana de muestreo
+                        week = db.week_for_date(_dt.date.fromisocalendar(int(year[1]), int(wk[1]), 7))
+                    except ValueError:
+                        week = None
+                elif season:
+                    week = db.ensure_week(int(season[1]), int(wk[1]))
+            cards = [{"name": c["name"], "code": ph.parse_bbch_code(c["chip"]), "notes": c["notes"],
+                      "photos": {k: (lambda src=src, zf=zf, name=name: _image_bytes(src, zf, name))
+                                 for k, src in c["photos"].items()}} for c in parser.cards]
+            out.append((name, week, cards))
+    return out
+
+
+def import_reports(db, paths: list[str], progress=None) -> ReportImport:
+    """Completa registros a partir de informes semanales (PDF, o HTML/ZIP de versiones
+    anteriores). No sobrescribe lo existente."""
+    res = ReportImport()
+    varieties = {v["name"].lower(): v for v in db.list_varieties(include_archived=True)}
+    sources = _parse_sources(db, paths)
+    tmp = os.path.join(data_subdir("tmp", "restore"), "informe.jpg")
+    for i, (name, week, cards) in enumerate(sources):
+        if progress:
+            progress(i, len(sources))
+        if week is None:
+            res.skipped.append(f"{name}: no es un informe semanal")
+            continue
+        res.reports += 1
+        for card in cards:
+            vname = card["name"].strip()
+            if not vname:
+                continue
+            v = varieties.get(vname.lower())
+            if v is None:
+                v = db.get_variety(db.add_variety(vname))
+                varieties[vname.lower()] = v
+            obs = db.get_or_create_observation(v["id"], week["id"])
+            fields = {}
+            code = card["code"]
+            if code is not None and obs["bbch_code"] is None:
+                fields.update(bbch_code=code, bbch_label=ph.bbch_label(code, db.bbch_names()))
+                res.bbch += 1
+            notes = " ".join(card["notes"].split())
+            if notes and not (obs["notes"] or "").strip():
+                fields["notes"] = notes
+            if fields:
+                db.update_observation(obs["id"], **fields)
+            have = db.get_photos(obs["id"])
+            missing_file = {k: p for k, p in have.items() if not os.path.exists(p["path"])}
+            for kind, read in card["photos"].items():
+                if kind in have and kind not in missing_file:
+                    continue
+                try:
+                    data = read()
+                except Exception:  # noqa: BLE001
+                    data = None
+                if not data:
+                    continue
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                dest_dir = data_subdir("photos", f"T{week['season']}", f"S{week['week_number']:02d}")
+                stored = store_photo(tmp, dest_dir, ph.photo_basename(v, week["start_date"], kind,
+                                                                      trial=db.code),
+                                     exact=True)
+                if kind in missing_file:
+                    _set_path(db, missing_file[kind]["id"], stored)
+                else:
+                    db.add_photo(obs["id"], kind, stored, source="informe")
+                res.photos += 1
+            if fields or card["photos"]:
+                res.observations += 1
+    db.log("import", "reports", None, res.summary())
+    return res

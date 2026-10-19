@@ -1,0 +1,908 @@
+"""
+reporter.py
+===========
+Generador de informes HTML estáticos y autocontenidos (Jinja2).
+
+Informes
+--------
+1. ``weekly``   Comparativa inter-varietal de una semana de muestreo.
+2. ``period``   Evolución de todas las variedades en un rango de semanas / mes.
+3. ``variety``  Timeline longitudinal de una variedad + datos biométricos.
+4. ``matrix``   Matriz comparativa global (heatmap BBCH, precocidad relativa,
+                hitos fenológicos y galería paralela).
+
+Empaquetado
+-----------
+* ``package="html"``: un único .html con las imágenes embebidas en Base64
+  (redimensionadas/comprimidas para poder enviarse por WhatsApp o correo).
+* ``package="zip"``:  .zip portátil con ``index.html`` + carpeta ``img/``
+  (imágenes en mayor resolución).
+"""
+from __future__ import annotations
+
+import base64
+from html import escape
+import datetime as _dt
+import io
+import json
+import os
+from dataclasses import dataclass
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from PIL import Image, ImageOps
+
+import phenology as ph
+from platform_utils import APP_NAME, resource_path, slugify
+
+PHOTO_KINDS = (("canopy", "Canopia / planta completa"), ("detail", "Detalle / macro"))
+MILESTONES = [(4, "Apertura de yema"), (6, "Cuello rugoso"), (7, "Gancho"),
+              (8, "Inicio floración"), (9, "Inicio cuaja"), (11, "Fruta roja")]   # estados de la ficha
+
+
+# ===========================================================================
+# Colores del heatmap (secuencial: crema claro -> burdeos cranberry)
+# ===========================================================================
+_SEQ_LIGHT = (0xF1, 0xEE, 0xE6)
+_SEQ_DARK = (0x5E, 0x0F, 0x1C)
+
+
+def seq_color(code: int | None) -> tuple[str, str]:
+    """(fondo, texto) para un código BBCH en la rampa secuencial."""
+    if code is None:
+        return "transparent", "inherit"
+    t = max(0.0, min(1.0, ph.bbch_value(code) / 85.0)) ** 0.85
+    rgb = tuple(round(a + (b - a) * t) for a, b in zip(_SEQ_LIGHT, _SEQ_DARK))
+    lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255
+    return "#%02x%02x%02x" % rgb, ("#ffffff" if lum < 0.5 else "#1f2413")
+
+
+# ===========================================================================
+# Imágenes
+# ===========================================================================
+class ImageStore:
+    """
+    Convierte fotos a data-URI (modo html), deja la ruta del archivo (modo pdf: el
+    PDF las reduce al incrustarlas) o miniaturas locales en caché referenciadas por
+    file:// (modo preview: rápido y con poca memoria, para la vista previa en la app).
+    """
+
+    def __init__(self, package: str, max_side: int, quality: int, cache_dir: str | None = None):
+        self.package = package
+        self.cache_dir = cache_dir
+        self.max_side = max_side
+        self.quality = quality
+        self.files: dict[str, bytes] = {}
+        self._cache: dict[tuple[str, int], str] = {}
+
+    def _encode(self, path: str, max_side: int) -> bytes:
+        img = Image.open(path)
+        img.draft("RGB", (max_side, max_side))  # decodificación JPEG reducida
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=self.quality, optimize=True, progressive=True)
+        return buf.getvalue()
+
+    def src(self, path: str | None, max_side: int | None = None) -> str | None:
+        if not path or not os.path.exists(path):
+            return None
+        side = max_side or self.max_side
+        key = (path, side)
+        if key in self._cache:
+            return self._cache[key]
+        if self.package == "pdf":
+            return path
+        if self.package == "preview":
+            uri = self._preview_file(path, min(side, 720))
+            self._cache[key] = uri
+            return uri
+        try:
+            data = self._encode(path, side)
+        except Exception:
+            return None
+        uri = "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+        self._cache[key] = uri
+        return uri
+
+    def _preview_file(self, path: str, side: int) -> str | None:
+        import hashlib
+        key = hashlib.md5(f"{path}|{os.path.getmtime(path)}|{side}".encode()).hexdigest()
+        dest = os.path.join(self.cache_dir, key + ".jpg")
+        if not os.path.exists(dest):
+            try:
+                with open(dest, "wb") as f:
+                    f.write(self._encode(path, side))
+            except Exception:
+                return None
+        return "file://" + os.path.abspath(dest)
+
+
+# ===========================================================================
+# SVG (gráficos sin JavaScript, 100 % offline)
+# ===========================================================================
+def svg_progress(points: list[tuple[int, int]], week_min: int, week_max: int,
+                 width: int = 640, height: int = 220, spark: bool = False,
+                 wlabel=None) -> str:
+    """Curva escalonada BBCH vs semana para una sola serie (una variedad)."""
+    if not points:
+        return ""
+    wlabel = wlabel or (lambda n: n)   # n.º de semana de muestreo -> semana del año
+    pad_l, pad_r, pad_t, pad_b = (4, 4, 4, 4) if spark else (40, 14, 12, 28)
+    w, h = width - pad_l - pad_r, height - pad_t - pad_b
+    span = max(1, week_max - week_min)
+
+    def x(week):
+        return pad_l + (week - week_min) / span * w
+
+    def y(code):
+        return pad_t + (1 - ph.bbch_value(code) / 99.0) * h
+
+    pts = sorted(points)
+    path = f"M{x(pts[0][0]):.1f},{y(pts[0][1]):.1f}"
+    for (_w0, c0), (w1, c1) in zip(pts, pts[1:]):
+        path += f" L{x(w1):.1f},{y(c0):.1f} L{x(w1):.1f},{y(c1):.1f}"
+    parts = [f'<svg class="chart{" spark" if spark else ""}" viewBox="0 0 {width} {height}" '
+             f'role="img" aria-label="Progresión fenológica por semana">']
+    if not spark:
+        for code, name in ((1, "E1"), (5, "E5"), (6, "E6"), (8, "E8"), (9, "E9"), (11, "E11")):
+            parts.append(f'<line class="grid" x1="{pad_l}" x2="{width - pad_r}" '
+                         f'y1="{y(code):.1f}" y2="{y(code):.1f}"/>'
+                         f'<text class="tick" x="{pad_l - 6}" y="{y(code) + 4:.1f}" '
+                         f'text-anchor="end">{name}</text>')
+        step = 1 if span <= 12 else (2 if span <= 24 else 4)
+        for wk in range(week_min, week_max + 1, step):
+            parts.append(f'<text class="tick" x="{x(wk):.1f}" y="{height - 8}" '
+                         f'text-anchor="middle">S{wlabel(wk)}</text>')
+    parts.append(f'<path class="line" d="{path}"/>')
+    for wk, code in pts:
+        r = 2.5 if spark else 4.5
+        label = ph.bbch_label(code)
+        parts.append(f'<circle class="dot" cx="{x(wk):.1f}" cy="{y(code):.1f}" r="{r}">'
+                     f'<title>Semana {wlabel(wk)} · {label}</title></circle>')
+    if not spark:
+        wk, code = pts[-1]
+        parts.append(f'<text class="direct" x="{min(x(wk) + 6, width - pad_r - 2):.1f}" '
+                     f'y="{y(code) - 8:.1f}" text-anchor="end">Estado {ph.code_str(code)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# ===========================================================================
+# Gráfico comparativo interactivo: semana (x) vs estado fenológico (y)
+# ===========================================================================
+# Bandas en posiciones de la escala (ver phenology.CRAN_STAGES).
+BANDS = [(0, 9, "Yema (E1-E4)"), (30, 39, "Elongación (E5)"), (50, 59, "Cuello/gancho (E6-E7)"),
+         (60, 69, "Floración (E8)"), (70, 79, "Cuaja/verde (E9-E10)"), (80, 89, "Fruta roja (E11)")]
+MAX_SELECTED = 4
+
+
+def compare_chart(series: list[dict], week_min: int, week_max: int,
+                  selected_ids: list[int], wlabel=None) -> dict | None:
+    """
+    series: [{"id", "name", "points": [(semana, bbch), ...]}]. Todas las variedades se
+    dibujan como contexto gris; las seleccionadas (máx. 4) en color con etiqueta
+    directa. El estado inicial es SVG estático (funciona sin JavaScript); el script
+    del informe permite cambiar la selección y muestra un tooltip por semana.
+    """
+    series = [s_ for s_ in series if s_["points"]]
+    if not series:
+        return None
+    wlabel = wlabel or (lambda n: n)   # n.º de semana de muestreo -> semana del año
+    week_max = max(week_max, week_min + 1)
+    W, H = 720, 320
+    pl, pr, pt, pb = 92, 96, 14, 30
+    w, h = W - pl - pr, H - pt - pb
+
+    def x(wk):
+        return pl + (wk - week_min) / (week_max - week_min) * w
+
+    def y(code):   # código BBCH o promedio de repeticiones (float)
+        return pt + (1 - ph.scale_pos(code) / 99.0) * h
+
+    out = [f'<svg class="cmp" viewBox="0 0 {W} {H}" role="img" '
+           f'aria-label="Estado fenológico por semana, comparación entre variedades">']
+    for i, (lo, hi, name) in enumerate(BANDS):
+        out.append(f'<rect class="band{" alt" if i % 2 else ""}" x="{pl}" y="{y(hi + .5):.1f}" '
+                   f'width="{w}" height="{y(lo - .5) - y(hi + .5):.1f}"/>'
+                   f'<text class="band-l" x="{pl - 8}" y="{(y(lo) + y(hi)) / 2 + 4:.1f}" '
+                   f'text-anchor="end">{name}</text>')
+    step = 1 if week_max - week_min <= 14 else (2 if week_max - week_min <= 28 else 4)
+    for wk in range(week_min, week_max + 1, step):
+        out.append(f'<text class="tick" x="{x(wk):.1f}" y="{H - 10}" text-anchor="middle">S{wlabel(wk)}</text>')
+    sel = [i for i in selected_ids if any(s_["id"] == i for s_ in series)][:MAX_SELECTED]
+    ordered = sorted(series, key=lambda s_: s_["id"] in sel)  # seleccionadas al frente
+    for s_ in ordered:
+        pts = sorted(s_["points"])
+        on = s_["id"] in sel
+        slot = sel.index(s_["id"]) + 1 if on else 0
+        d = " ".join(f"{'M' if i == 0 else 'L'}{x(wk):.1f},{y(c):.1f}" for i, (wk, c) in enumerate(pts))
+        out.append(f'<g class="series {"on s" + str(slot) if on else "off"}" data-id="{s_["id"]}">'
+                   f'<path d="{d}"/>')
+        for wk, c in pts:
+            out.append(f'<circle class="dot" cx="{x(wk):.1f}" cy="{y(c):.1f}" r="4">'
+                       f'<title>{escape(s_["name"])} · Semana {wlabel(wk)} · '
+                       f'{ph.bbch_label(c) if isinstance(c, int) else "Estado medio " + f"{c:.1f}".replace(".", ",")}'
+                       f'</title></circle>')
+        lw, lc = pts[-1]
+        out.append(f'<text class="end" x="{x(lw) + 8:.1f}" y="{y(lc) + 4:.1f}">{escape(s_["name"])}</text></g>')
+    out.append(f'<line class="xhair" x1="0" x2="0" y1="{pt}" y2="{pt + h}"/>'
+               f'<rect class="hit" x="{pl}" y="{pt}" width="{w}" height="{h}"/></svg>')
+    data = {str(s_["id"]): {"name": s_["name"], "pts": {str(wk): c for wk, c in s_["points"]}}
+            for s_ in series}
+    return {"svg": "".join(out), "chips": [{"id": s_["id"], "name": s_["name"],
+                                            "slot": sel.index(s_["id"]) + 1 if s_["id"] in sel else 0}
+                                           for s_ in series],
+            # Datos sin dibujar: el informe PDF traza su propio gráfico con ellos.
+            "raw": {"series": series, "sel": sel, "wmin": week_min, "wmax": week_max,
+                    "labels": {n: wlabel(n) for n in range(week_min, week_max + 1)}},
+            "json": json.dumps({"series": data, "wmin": week_min, "wmax": week_max,
+                                "labels": {str(n): wlabel(n) for n in range(week_min, week_max + 1)},
+                                "pl": pl, "w": w, "vw": W}, ensure_ascii=False).replace("</", "<\\/")}
+
+
+def _default_selection(heat_rows: list[dict], k: int = 2) -> list[int]:
+    """Por defecto: la variedad más adelantada y la más tardía (último estado)."""
+    last = [(r["variety"]["id"], next((c["code"] for c in reversed(r["cells"])
+                                       if c["code"] is not None), None)) for r in heat_rows]
+    last = [t for t in last if t[1] is not None]
+    if not last:
+        return []
+    last.sort(key=lambda t: ph.bbch_value(t[1]))
+    ids = [last[-1][0], last[0][0]]
+    return list(dict.fromkeys(ids))[:k]
+
+
+# ===========================================================================
+# Generador
+# ===========================================================================
+@dataclass
+class ReportResult:
+    path: str
+    title: str
+    kind: str
+    size_kb: int
+
+
+class LabeledDB:
+    """La base vista por los informes: en ensayos de tratamientos, cada parcela lleva el
+    significado de su tratamiento («Testigo (T1R1)» en vez de «T1R1»). Todo lo demás pasa
+    tal cual a la base real."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def _names(self):
+        return self._db.treatment_names() if getattr(self._db, "is_trial", False) else {}
+
+    def _label(self, v, names):
+        if v and names and v.get("treatment"):
+            v = dict(v)
+            v["name"] = self._db.display_name(v, names)
+        return v
+
+    def list_varieties(self, *a, **kw):
+        names = self._names()
+        return [self._label(v, names) for v in self._db.list_varieties(*a, **kw)]
+
+    def get_variety(self, variety_id):
+        return self._label(self._db.get_variety(variety_id), self._names())
+
+    def week_overview(self, *a, **kw):
+        names = self._names()
+        rows = self._db.week_overview(*a, **kw)
+        for r in rows:
+            r["variety"] = self._label(r["variety"], names)
+        return rows
+
+    def list_entries(self, *a, **kw):
+        names = self._names()
+        rows = self._db.list_entries(*a, **kw)
+        if names:
+            by_id = {v["id"]: v for v in self._db.list_varieties(include_archived=True)}
+            for e in rows:
+                v = by_id.get(e.get("variety_id"))
+                if v and v.get("treatment"):
+                    e["variety_name"] = self._db.display_name(v, names)
+        return rows
+
+
+class ReportGenerator:
+    def __init__(self, db, out_dir: str, preview_dir: str | None = None):
+        self.db = LabeledDB(db)
+        self.out_dir = out_dir
+        self.preview_dir = preview_dir or os.path.join(os.path.dirname(out_dir), "preview")
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.preview_dir, "img"), exist_ok=True)
+        self.env = Environment(loader=FileSystemLoader(resource_path("templates")),
+                               autoescape=select_autoescape(["html"]))
+        self.env.filters["bbch"] = lambda c: ph.bbch_label(c, self.db.bbch_names())
+        self.env.filters["seq"] = seq_color
+        self.env.filters["date_es"] = lambda s: ph.format_date_es(_dt.date.fromisoformat(s[:10]))
+        self.env.filters["num"] = self._num
+        self.env.filters["code"] = ph.code_str     # «07», «65», «89-1»
+        self.env.filters["wk"] = ph.week_title      # «Semana 33, año 2026»
+        self.env.filters["wks"] = ph.week_short     # «S33»
+        self.env.globals.update(macro_name=lambda c: ph.MACRO_STAGES.get(ph.macro_of(c), ""),
+                                macro_color=lambda c: ph.MACRO_COLORS.get(ph.macro_of(c), "#ccc"),
+                                app_name=APP_NAME)
+
+    @staticmethod
+    def _num(v, digits: int = 1) -> str:
+        if v is None or v == "":
+            return "—"
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        return f"{f:.0f}" if f.is_integer() else f"{f:.{digits}f}".replace(".", ",")
+
+    # -------------------------------------------------------------- común
+    def _images(self, package: str, max_side: int = 960) -> ImageStore:
+        return ImageStore(package, max_side=max_side, quality=72,
+                          cache_dir=os.path.join(self.preview_dir, "img"))
+
+    def _render(self, template: str, filename: str, kind: str, title: str,
+                images: ImageStore, package: str, **ctx) -> ReportResult:
+        generated = _dt.datetime.now().strftime("%d-%m-%Y %H:%M")
+        ws = getattr(self.db, "workspace", None) or {}
+        if ws:   # ensayo o predio: en el subtítulo y (código) en el nombre del archivo
+            from workspaces import Workspaces
+            ctx["subtitle"] = " · ".join(x for x in (Workspaces.title(ws), ctx.get("subtitle")) if x)
+            head, _, tail = filename.partition("_")
+            filename = f"{head}_{self.db.code}_{tail}" if tail else f"{head}_{self.db.code}"
+        html = "" if package == "pdf" else self.env.get_template(template).render(
+            title=title, generated=generated, package=package, **ctx)
+        base = os.path.join(self.out_dir, filename)
+        if package == "preview":
+            # Vista previa: no se guarda como informe ni se registra en la bitácora.
+            path = os.path.join(self.preview_dir, "vista_previa.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+            return ReportResult(path, title, kind, max(1, len(html.encode()) // 1024))
+        if package == "pdf":
+            import pdf_report
+            path = base + ".pdf"
+            data = pdf_report.render(template, dict(ctx, title=title, generated=generated),
+                                     self.db.bbch_names(), self._num)
+            with open(path, "wb") as f:
+                f.write(data)
+        else:
+            path = base + ".html"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+        self.db.log("create", "report", None, f"{kind}: {os.path.basename(path)}")
+        return ReportResult(path, title, kind, max(1, os.path.getsize(path) // 1024))
+
+    include_all_photos = False  # True: agrega las fotos no principales como miniaturas
+    # Fotos de los informes: "both" (Full: general + detalle), "detail" o "canopy" (general).
+    # Siempre la foto representativa (principal) de cada tipo.
+    photo_mode = "both"
+    PHOTO_MODES = {"both": "Full (general y detalle)", "detail": "Solo detalle", "canopy": "Solo general"}
+
+    def _kinds(self) -> tuple[str, ...]:
+        return ("canopy", "detail") if self.photo_mode not in ("detail", "canopy") else (self.photo_mode,)
+
+    def _extras(self, obs: dict | None, images: ImageStore) -> list[str]:
+        if not (self.include_all_photos and obs):
+            return []
+        return [src for p in self.db.list_photos(obs["id"])
+                if not p["is_primary"] and p["kind"] in self._kinds()
+                for src in [images.src(p["path"], 360)] if src]
+
+    def _attachments(self, variety_id: int, week_id: int, images: ImageStore) -> list[dict]:
+        """Fotos adjuntas al registro semanal de la variedad (con su descripción)."""
+        return [{"src": src, "caption": f["caption"] or ""}
+                for f in self.db.list_attachments(variety_id, week_id=week_id)
+                for src in [images.src(f["path"], 480)] if src]
+
+    MAX_PROGRESS_WEEKS = 12   # columnas de semana que caben legibles en una hoja
+
+    def _progress(self, season: int, weeks: list[dict]) -> list[dict]:
+        """Mediciones en informes de período y matriz, resumidas: por cada variable
+        numérica, una tabla variedad (o sector) × semana con el promedio de la semana y el
+        avance (última − primera). Las de imágenes: fotos por semana."""
+        from measures_export import as_number
+        nums = {w["week_number"] for w in weeks}
+        who = "Sector" if getattr(self.db, "is_predio", False) else "Variedad"
+        out = []
+        for m in self.db.list_measures():
+            entries = [e for e in self.db.list_entries(m["id"], season=season)
+                       if e["week_number"] in nums]
+            if not entries:
+                continue
+            used = [w for w in weeks if any(e["week_number"] == w["week_number"] for e in entries)]
+            used = used[-self.MAX_PROGRESS_WEEKS:]   # temporada larga: las últimas semanas
+            entries = [e for e in entries if e["week_number"] in {w["week_number"] for w in used}]
+            labels = [ph.week_short(w) for w in used]
+            names = []
+            for e in entries:
+                n = e["variety_name"] or "General"
+                if n not in names:
+                    names.append(n)
+
+            def cell(vals):
+                if not vals:
+                    return ""
+                v = sum(vals) / len(vals)
+                return f"{v:.1f}".replace(".", ",") if not float(v).is_integer() else str(int(v))
+
+            if m["kind"] == "images":
+                rows = [[n] + [str(sum(1 for e in entries if (e["variety_name"] or "General") == n
+                                       and e["week_number"] == w["week_number"]) or "")
+                               for w in used] for n in names]
+                out.append({"name": m["name"], "variable": "Fotos por semana", "weeks": labels,
+                            "rows": rows, "advance": False, "who": who})
+                continue
+            cols = list(m["columns"])
+            for e in entries:
+                cols += [k for k in e["data"] if k not in cols]
+            for col in cols:
+                grid = {}
+                for e in entries:
+                    v = as_number(e["data"].get(col))
+                    if v is not None:
+                        grid.setdefault((e["variety_name"] or "General", e["week_number"]), []).append(v)
+                if not grid:
+                    continue   # columna de texto: queda en el informe semanal y en Excel
+                rows = []
+                for n in names:
+                    series = [grid.get((n, w["week_number"]), []) for w in used]
+                    if not any(series):
+                        continue
+                    means = [sum(x) / len(x) for x in series if x]
+                    delta = means[-1] - means[0] if len(means) > 1 else None
+                    rows.append([n] + [cell(x) for x in series] + [
+                        "" if delta is None else (("+" if delta > 0 else "") + cell([delta]))])
+                out.append({"name": m["name"], "variable": col, "weeks": labels, "rows": rows,
+                            "advance": True, "who": who})
+        return out
+
+    def _measures(self, images: ImageStore, week_id: int | None = None, season: int | None = None,
+                  variety_id: int | None = None) -> list[dict]:
+        """Mediciones personalizadas con registros (de la semana o, por variedad, de la temporada)."""
+        out = []
+        for m in self.db.list_measures():
+            entries = self.db.list_entries(m["id"], week_id=week_id, season=season)
+            if variety_id is not None:
+                entries = [e for e in entries if e["variety_id"] == variety_id]
+            if m["kind"] == "table":   # filas sin datos (agregadas y no completadas)
+                entries = [e for e in entries if any(str(v).strip() for v in e["data"].values())]
+            if not entries:
+                continue
+            if m["kind"] == "table":
+                cols = list(m["columns"])
+                for e in entries:
+                    cols += [k for k in e["data"] if k not in cols]
+                rows = [{"week": ph.week_short(e), "variety": e["variety_name"] or "General",
+                         "values": [e["data"].get(col, "") for col in cols]} for e in entries]
+                out.append({"name": m["name"], "kind": "table", "columns": cols, "rows": rows})
+            else:
+                items = [{"src": src, "caption": e["caption"] or "",
+                          "when": " · ".join(x for x in (
+                              ph.week_short(e) if week_id is None else "",
+                              (e["variety_name"] or "General") if variety_id is None else "") if x)}
+                         for e in entries for src in [images.src(e["path"], 480)] if src]
+                if items:
+                    out.append({"name": m["name"], "kind": "images", "pics": items})
+        return out
+
+    def _photo_ctx(self, photos: dict, images: ImageStore, max_side: int | None = None) -> dict:
+        return {kind: images.src(photos[kind]["path"], max_side)
+                if kind in photos and kind in self._kinds() else None for kind, _ in PHOTO_KINDS}
+
+    def _obs_ctx(self, obs: dict | None) -> dict:
+        if not obs:
+            return {"code": None, "notes": "", "ai_code": None, "ai_conf": None,
+                    "ai_accepted": None, "observed_at": None, "geo": None}
+        geo_ = None
+        if obs.get("latitude") is not None and obs.get("longitude") is not None:
+            import geo
+            geo_ = {"text": geo.fmt(obs["latitude"], obs["longitude"]),
+                    "link": geo.osm_link(obs["latitude"], obs["longitude"]),
+                    "acc": obs.get("gps_accuracy"), "source": obs.get("gps_source") or ""}
+        return {"code": obs["bbch_code"], "notes": obs["notes"] or "",
+                "ai_code": obs["ai_code"], "ai_conf": obs["ai_confidence"],
+                "ai_accepted": obs["ai_accepted"], "observed_at": obs["observed_at"], "geo": geo_}
+
+    def _compare(self, heat: list[dict], weeks: list[dict], selected: list[int] | None = None):
+        if len(weeks) < 2:
+            return None
+        series = [{"id": r["variety"]["id"], "name": r["variety"]["name"],
+                   "points": [(c["week"]["week_number"], c["code"]) for c in r["cells"]
+                              if c["code"] is not None]} for r in heat]
+        sel = selected if selected is not None else _default_selection(heat)
+        return compare_chart(series, weeks[0]["week_number"], weeks[-1]["week_number"], sel,
+                             self._wlabel(weeks[0]["season"]))
+
+    def _wlabel(self, season: int):
+        """n.º de semana de muestreo -> n.º de semana del año (rótulos de los gráficos)."""
+        start = self.db.season_start(season)
+        return lambda n: ph.week_of_year(ph.week_start(start, n).isoformat())
+
+    def _heatmap(self, season: int, weeks: list[dict], varieties: list[dict]) -> list[dict]:
+        matrix = self.db.phenology_matrix(season)
+        rows = []
+        for v in varieties:
+            cells = []
+            for w in weeks:
+                o = matrix.get((v["id"], w["week_number"]))
+                cells.append({"week": w, "code": o["bbch_code"] if o else None})
+            rows.append({"variety": v, "cells": cells})
+        return rows
+
+    # ------------------------------------------------------ 1. semanal
+    def weekly(self, week_id: int, package: str = "html") -> ReportResult:
+        week = self.db.get_week(week_id)
+        images = self._images(package)
+        cards = []
+        for row in self.db.week_overview(week_id):
+            cards.append({"variety": row["variety"], **self._obs_ctx(row["observation"]),
+                          "img": self._photo_ctx(row["photos"], images),
+                          "extras": self._extras(row["observation"], images),
+                          "attachments": self._attachments(row["variety"]["id"], week_id, images)})
+        done = sum(1 for c in cards if c["code"] is not None)
+        title = f"Reporte semanal · {ph.week_title(week)}"
+        return self._render(
+            "weekly.html", "semanal_{1}_S{0:02d}".format(*ph.iso_week(week["start_date"])),
+            "semanal", title, images, package, week=week, cards=cards,
+            measures=self._measures(images, week_id=week_id),
+            subtitle=f"{week['label']} · {ph.week_title(week)}",
+            stats={"varieties": len(cards), "done": done,
+                   "photos": sum(bool(c["img"]["canopy"]) + bool(c["img"]["detail"]) for c in cards)})
+
+    # ---------------------------------------------- 2. periodo / mensual
+    def period(self, season: int, week_from: int, week_to: int, package: str = "html",
+               title: str | None = None) -> ReportResult:
+        if week_to < week_from:
+            week_from, week_to = week_to, week_from
+        self.db.ensure_weeks(season, week_to)
+        weeks = [w for w in self.db.list_weeks(season, include_skipped=False) if week_from <= w["week_number"] <= week_to]
+        varieties = self.db.list_varieties()
+        images = self._images(package, max_side=480)
+        heat = self._heatmap(season, weeks, varieties)
+        strips = []
+        for v in varieties:
+            tiles = []
+            for w in weeks:
+                obs = self.db.get_observation(v["id"], w["id"])
+                photos = self.db.get_photos(obs["id"]) if obs else {}
+                tiles.append({"week": w, **self._obs_ctx(obs),
+                              "img": self._photo_ctx(photos, images, 480)})
+            first = next((t["code"] for t in tiles if t["code"] is not None), None)
+            last = next((t["code"] for t in reversed(tiles) if t["code"] is not None), None)
+            strips.append({"variety": v, "tiles": tiles, "first": first, "last": last,
+                           "advance": round(ph.bbch_value(last) - ph.bbch_value(first), 1) + 0.0
+                           if first is not None and last is not None else None})
+        start = _dt.date.fromisoformat(weeks[0]["start_date"])
+        end = _dt.date.fromisoformat(weeks[-1]["start_date"]) + _dt.timedelta(days=6)
+        title = title or f"Evolución · Semanas {ph.week_of_year(weeks[0])}–{ph.week_of_year(weeks[-1])}"
+        return self._render(
+            "period.html", f"periodo_{season}_S{ph.week_of_year(weeks[0]):02d}-S{ph.week_of_year(weeks[-1]):02d}", "periodo",
+            title, images, package, weeks=weeks, heat=heat, strips=strips, compare=self._compare(heat, weeks),
+            progress=self._progress(season, weeks),
+            subtitle=f"Del {ph.format_date_es(start, False)} al {ph.format_date_es(end)} · "
+                     f"{ph.season_title(season)}")
+
+    def monthly(self, season: int, year: int, month: int, package: str = "html") -> ReportResult:
+        weeks = [w for w in self.db.list_weeks(season, include_skipped=False)
+                 if (d := _dt.date.fromisoformat(w["start_date"])).year == year and d.month == month]
+        if not weeks:
+            raise ValueError("No hay semanas de muestreo que comiencen en ese mes.")
+        nums = [w["week_number"] for w in weeks]
+        return self.period(season, min(nums), max(nums), package,
+                           title=f"Reporte mensual · {ph.MESES[month - 1].capitalize()} {year}")
+
+    # --------------------------------------------------- 3. por variedad
+    def variety(self, variety_id: int, season: int, package: str = "html") -> ReportResult:
+        v = self.db.get_variety(variety_id)
+        images = self._images(package)
+        timeline = []
+        for o in self.db.variety_timeline(variety_id, season):
+            timeline.append({"week_number": o["week_number"], "week_label": o["week_label"],
+                             "start_date": o["start_date"], **self._obs_ctx(o),
+                             "img": self._photo_ctx(o["photos"], images),
+                             "attachments": self._attachments(variety_id, o["week_id"], images),
+                             "extras": self._extras(o, images)})
+        pts = [(t["week_number"], t["code"]) for t in timeline if t["code"] is not None]
+        chart = svg_progress(pts, min(p[0] for p in pts), max(max(p[0] for p in pts),
+                             min(p[0] for p in pts) + 1), wlabel=self._wlabel(season)) if pts else ""
+        milestones = []
+        for code, name in MILESTONES:
+            hit = next((p for p in sorted(pts) if ph.bbch_value(p[1]) >= ph.bbch_value(code)), None)
+            milestones.append({"code": code, "name": name,
+                               "week": self._wlabel(season)(hit[0]) if hit else None})
+        metrics = self.db.get_metrics(variety_id, season)
+        custom = self.db.list_custom_fields(variety_id, season)
+        attachments = [{"src": src, "caption": f["caption"] or "",   # generales (sin semana)
+                        "when": ph.format_date_es(_dt.date.fromisoformat(f["captured_at"][:10]))}
+                       for f in self.db.list_attachments(variety_id, season, general=True)
+                       for src in [images.src(f["path"], 480)] if src]
+        all_weeks = self.db.list_weeks(season, include_skipped=False)
+        compare = self._compare(self._heatmap(season, all_weeks, self.db.list_varieties()),
+                                all_weeks, [variety_id])
+        title = f"Ficha fenológica · {v['name']}"
+        return self._render(
+            "variety.html", f"variedad_{slugify(v['name'])}_{season}", "variedad", title,
+            images, package, variety=v, timeline=timeline, chart=chart, metrics=metrics,
+            compare=compare, attachments=attachments,
+            measures=self._measures(images, season=season, variety_id=variety_id),
+            custom=custom, milestones=milestones,
+            subtitle=f"Timeline longitudinal · {ph.season_title(season)}")
+
+    # ------------------------------------------------ 4. matriz global
+    def matrix(self, season: int, week_from: int | None = None, week_to: int | None = None,
+               package: str = "html") -> ReportResult:
+        weeks = self.db.list_weeks(season, include_skipped=False)
+        if week_from is not None:
+            weeks = [w for w in weeks if w["week_number"] >= week_from]
+        if week_to is not None:
+            weeks = [w for w in weeks if w["week_number"] <= week_to]
+        if not weeks:
+            raise ValueError("No hay semanas de muestreo registradas en la temporada.")
+        varieties = self.db.list_varieties()
+        heat = self._heatmap(season, weeks, varieties)
+        images = self._images(package, max_side=360)
+
+        # Precocidad relativa: diferencia media vs. el promedio de las variedades por semana.
+        week_means = {}
+        for i, w in enumerate(weeks):
+            vals = [ph.bbch_value(r["cells"][i]["code"]) for r in heat if r["cells"][i]["code"] is not None]
+            if len(vals) >= 2:
+                week_means[w["week_number"]] = sum(vals) / len(vals)
+        rows = []
+        wmin, wmax = weeks[0]["week_number"], weeks[-1]["week_number"]
+        gk = "canopy" if self.photo_mode == "canopy" else "detail"   # galería paralela
+        for r in heat:
+            pts = [(c["week"]["week_number"], c["code"]) for c in r["cells"] if c["code"] is not None]
+            deltas = [ph.bbch_value(code) - week_means[wk] for wk, code in pts if wk in week_means]
+            delta = round(sum(deltas) / len(deltas), 1) + 0.0 if deltas else None  # evita «-0.0»
+            hits = []
+            for code, name in MILESTONES:
+                hit = next((p for p in sorted(pts) if ph.bbch_value(p[1]) >= ph.bbch_value(code)), None)
+                hits.append(self._wlabel(season)(hit[0]) if hit else None)
+            gallery = []
+            for c in r["cells"]:
+                obs = self.db.get_observation(r["variety"]["id"], c["week"]["id"])
+                photos = self.db.get_photos(obs["id"]) if obs else {}
+                gallery.append({"week": c["week"], "code": c["code"],
+                                "src": images.src(photos[gk]["path"]) if gk in photos else None})
+            rows.append({"variety": r["variety"], "delta": delta, "hits": hits,
+                         "last": pts[-1][1] if pts else None, "pts": pts,
+                         "spark": svg_progress(pts, wmin, max(wmax, wmin + 1), 160, 40, spark=True,
+                                               wlabel=self._wlabel(season))
+                         if pts else "", "gallery": gallery})
+        max_abs = max([abs(r["delta"]) for r in rows if r["delta"] is not None] or [1.0]) or 1.0
+        ranking = sorted([r for r in rows if r["delta"] is not None], key=lambda r: -r["delta"])
+        title = "Matriz comparativa inter-varietal"
+        return self._render(
+            "matrix.html", f"matriz_{season}", "matriz", title, images, package,
+            weeks=weeks, heat=heat, rows=rows, compare=self._compare(heat, weeks), ranking=ranking, max_abs=max_abs,
+            progress=self._progress(season, weeks),
+            milestones=MILESTONES,
+            gallery_label="fotos generales" if gk == "canopy" else "fotos de detalle",
+            subtitle=f"Avance fenológico relativo · {ph.season_title(season)} · "
+                     f"Semanas {ph.week_of_year(weeks[0])}–{ph.week_of_year(weeks[-1])}",
+            data_json=json.dumps([{"variedad": r["variety"]["name"],
+                                   "bbch": [c["code"] for c in h["cells"]]}
+                                  for r, h in zip(rows, heat)], ensure_ascii=False).replace("</", "<\\/"))
+
+
+    # ------------------------------------- 5. tratamientos × repeticiones
+    def treatments(self, season: int, package: str = "html") -> ReportResult:
+        """Compara tratamientos: promedio de las repeticiones por semana, ANOVA (bloques =
+        repeticiones), letras LSD, hitos fenológicos y mediciones numéricas."""
+        import trial_stats as st
+        from measures_export import as_number
+        trts = self.db.list_treatments()
+        if not trts or not any(t["parcels"] for t in trts):
+            raise ValueError("Este ensayo no tiene tratamientos ni parcelas (Ajustes › Parcelas).")
+        weeks = self.db.list_weeks(season, include_skipped=False)
+        if not weeks:
+            raise ValueError("No hay semanas de muestreo registradas en la temporada.")
+        matrix = self.db.phenology_matrix(season)
+        wl = self._wlabel(season)
+        num = self._num
+        parcels = [p for t in trts for p in t["parcels"]]
+        # Solo el tramo con datos (sin las semanas vacías del inicio y del final).
+        ids = {p["id"] for p in parcels}
+        used = {wn for (vid, wn), o in matrix.items() if vid in ids and o["bbch_code"] is not None}
+        used |= {e["week_number"] for m in self.db.list_measures()
+                 for e in self.db.list_entries(m["id"], season=season) if e["variety_id"] in ids}
+        if used:
+            weeks = [w for w in weeks if min(used) <= w["week_number"] <= max(used)]
+        where = {p["id"]: (p["treatment"], p["rep"]) for p in parcels}
+
+        def bbch_at(p, w):
+            o = matrix.get((p["id"], w["week_number"]))
+            return ph.bbch_value(o["bbch_code"]) if o and o["bbch_code"] is not None else None
+
+        def fmt_p(a):
+            if not a:
+                return "—"
+            p_ = a["p"]
+            return ("< 0,001" if p_ < 0.001 else num(p_, 3)) + f" {a['stars']}"
+
+        # Promedio BBCH por tratamiento y semana (+ ANOVA de cada semana).
+        rows = [{"t": t, "cells": [], "pts": []} for t in trts]
+        tests = []
+        for w in weeks:
+            data = {(p["treatment"], p["rep"]): v for p in parcels for v in [bbch_at(p, w)] if v is not None}
+            a = st.anova(data)
+            for row in rows:
+                vals = [data[(row["t"]["num"], p["rep"])] for p in row["t"]["parcels"]
+                        if (row["t"]["num"], p["rep"]) in data]
+                m, se = st.mean_se(vals)
+                row["cells"].append({"mean": m, "se": se, "n": len(vals), "of": len(row["t"]["parcels"]),
+                                     "text": num(m) if m is not None else "",
+                                     "letter": (a or {}).get("letters", {}).get(row["t"]["num"], "")})
+                if m is not None:
+                    row["pts"].append((w["week_number"], round(float(m), 2)))
+            if a:
+                tests.append({"week": w, "f": num(a["f"], 2) if a["f"] < 1000 else "> 999",
+                              "p": fmt_p(a), "sig": a["stars"], "df": f"{a['df'][0]}; {a['df'][1]}",
+                              "cv": num(a["cv"]) + " %" if a["cv"] is not None else "—",
+                              "lsd": num(a["lsd"], 2) if a["lsd"] is not None else "—"})
+        series = [{"id": r["t"]["num"], "name": r["t"]["label"], "points": r["pts"]} for r in rows]
+        compare = compare_chart(series, weeks[0]["week_number"], weeks[-1]["week_number"],
+                                [r["t"]["num"] for r in rows][:MAX_SELECTED], wl)
+        if compare:
+            compare["raw"]["note"] = "Cada línea: promedio de las repeticiones del tratamiento."
+
+        # Precocidad: diferencia media de cada tratamiento con el promedio de los tratamientos.
+        week_means = {}
+        for i, w in enumerate(weeks):
+            ms = [r["cells"][i]["mean"] for r in rows if r["cells"][i]["mean"] is not None]
+            if len(ms) >= 2:
+                week_means[i] = sum(ms) / len(ms)
+        for r in rows:
+            ds = [r["cells"][i]["mean"] - m for i, m in week_means.items() if r["cells"][i]["mean"] is not None]
+            r["delta"] = round(sum(ds) / len(ds), 1) + 0.0 if ds else None
+            last = next((c for c in reversed(r["cells"]) if c["mean"] is not None), None)
+            r["last"] = num(last["mean"]) if last else "—"
+        ranking = sorted([r for r in rows if r["delta"] is not None], key=lambda r: -r["delta"])
+        max_abs = max([abs(r["delta"]) for r in ranking] or [1.0]) or 1.0
+
+        # Hitos: semana del año en que cada parcela llega al estado; promedio por tratamiento.
+        milestones = []
+        for code, name in MILESTONES:
+            target = ph.bbch_value(code)
+            hit = {}
+            for p in parcels:
+                wk = next((w for w in weeks if (v := bbch_at(p, w)) is not None and v >= target), None)
+                if wk is not None:
+                    hit[(p["treatment"], p["rep"])] = ph.week_of_year(wk)
+            if not hit:
+                continue
+            a = st.anova(hit)
+            cells = []
+            for t in trts:
+                vals = [hit[(t["num"], p["rep"])] for p in t["parcels"] if (t["num"], p["rep"]) in hit]
+                m, _se = st.mean_se(vals)
+                cells.append({"text": (f"S{num(m)}" + (f" {a['letters'].get(t['num'], '')}"
+                                                       if a and a["letters"] else "")) if m is not None else "—",
+                              "n": f"{len(vals)}/{len(t['parcels'])}"})
+            milestones.append({"code": code, "name": name, "cells": cells, "p": fmt_p(a)})
+
+        # Mediciones en planilla: columnas numéricas, promedio por tratamiento y semana.
+        measures = []
+        for m in self.db.list_measures():
+            if m["kind"] != "table":
+                continue
+            entries = [e for e in self.db.list_entries(m["id"], season=season) if e["variety_id"] in where]
+            cols = []
+            for e in entries:
+                cols += [k for k, v in e["data"].items() if k not in cols and as_number(v) is not None]
+            if not cols:
+                continue
+            blocks = []
+            for w in weeks:
+                es = [e for e in entries if e["week_id"] == w["id"]]
+                if not es:
+                    continue
+                trows = {t["num"]: [] for t in trts}
+                p_row = []
+                for col in cols:
+                    per = {}   # submuestras de una misma parcela -> su promedio
+                    for e in es:
+                        v = as_number(e["data"].get(col))
+                        if v is not None:
+                            per.setdefault(where[e["variety_id"]], []).append(float(v))
+                    data = {k: sum(v) / len(v) for k, v in per.items()}
+                    a = st.anova(data)
+                    p_row.append(fmt_p(a))
+                    for t in trts:
+                        mm, se = st.mean_se([v for (tt, _r), v in data.items() if tt == t["num"]])
+                        trows[t["num"]].append(
+                            "—" if mm is None else num(mm, 2) + (f" ± {num(se, 2)}" if se is not None else "")
+                            + (f" {a['letters'].get(t['num'], '')}" if a and a["letters"] else ""))
+                blocks.append({"week": w, "rows": [{"t": t["label"], "values": trows[t["num"]]} for t in trts],
+                               "p": p_row})
+            if blocks:
+                measures.append({"name": m["name"], "columns": cols, "blocks": blocks})
+
+        images = self._images(package, max_side=360)
+        nt, nr = self.db.trial_size()
+        title = "Comparación de tratamientos"
+        return self._render(
+            "treatments.html", f"tratamientos_{season}", "tratamientos", title, images, package,
+            weeks=weeks, rows=rows, tests=tests, compare=compare, ranking=ranking, max_abs=max_abs,
+            milestones=milestones, measures=measures, treatments=trts,
+            heat=self._heatmap(season, weeks, parcels), n_t=nt or len(trts), n_r=nr,
+            subtitle=f"{nt or len(trts)} tratamientos × {nr} repeticiones · {ph.season_title(season)} · "
+                     f"Semanas {ph.week_of_year(weeks[0])}–{ph.week_of_year(weeks[-1])}")
+
+
+# ===========================================================================
+# Resumen de contenido (para la pestaña «Vista previa»)
+# ===========================================================================
+EST_KB_PER_PHOTO = 75   # JPEG ~960 px q72 embebido en Base64
+
+
+def _missing_items(obs, photos) -> list[str]:
+    """Lo que falta para dar el registro por completo: estado fenológico y AL MENOS una foto
+    (canopia o detalle; ninguna de las dos es obligatoria por separado)."""
+    out = []
+    if not photos:
+        out.append("fotos")
+    if not obs or obs["bbch_code"] is None:
+        out.append("estado fenológico")
+    return out
+
+
+def report_summary(db, kind: str, season: int, week_id: int | None = None,
+                   week_from: int | None = None, week_to: int | None = None,
+                   variety_id: int | None = None) -> dict:
+    """Qué incluirá el informe y qué datos faltan (sin generar nada)."""
+    db = db if isinstance(db, LabeledDB) else LabeledDB(db)
+    varieties = db.list_varieties()
+    weeks = db.list_weeks(season, include_skipped=(kind == "weekly"))
+    if kind == "weekly":
+        weeks = [w for w in weeks if w["id"] == week_id]
+    elif kind == "period":
+        weeks = [w for w in weeks if week_from <= w["week_number"] <= week_to]
+    elif kind == "variety":
+        varieties = [v for v in varieties if v["id"] == variety_id]
+    cells = complete = photos = bbch = notes = miss_photos = 0
+    missing: list[str] = []
+    grid = {v["id"]: [] for v in varieties}
+    detail = {v["id"]: [] for v in varieties}   # celda a celda: foto, estado (vista previa)
+    for w in weeks:
+        for v in varieties:
+            obs = db.get_observation(v["id"], w["id"])
+            ph_ = db.get_photos(obs["id"]) if obs else {}
+            shown = ph_.get("detail") or ph_.get("canopy") or next(iter(ph_.values()), None)
+            detail[v["id"]].append({
+                "variety_id": v["id"], "week_id": w["id"], "week": ph.week_short(w),
+                "date": w["start_date"], "photo": shown["path"] if shown else None,
+                "code": obs["bbch_code"] if obs else None, "n_photos": len(ph_)})
+            cells += 1
+            photos += len(ph_)
+            miss_photos += 0 if ph_ else 1
+            has_bbch = bool(obs and obs["bbch_code"] is not None)
+            bbch += has_bbch
+            notes += bool(obs and (obs["notes"] or "").strip())
+            lack = _missing_items(obs, ph_)
+            grid[v["id"]].append(2 if not lack else (1 if (ph_ or has_bbch) else 0))
+            if not lack:
+                complete += 1
+            elif len(missing) < 40:
+                missing.append(f"{v['name']} · {ph.week_short(w)}: falta {', '.join(lack)}")
+    total_missing = cells - complete
+    return {"kind": kind, "varieties": len(varieties), "weeks": len(weeks), "cells": cells,
+            "complete": complete, "photos": photos, "photos_expected": cells,
+            "bbch": bbch, "notes": notes, "missing": missing,
+            "missing_more": max(0, total_missing - len(missing)),
+            "missing_photos": miss_photos, "missing_bbch": cells - bbch,
+            "grid": {"weeks": [ph.week_of_year(w) for w in weeks],
+                     "rows": [{"name": v["name"], "code": v["code"] or v["name"][:3],
+                               "cells": grid[v["id"]]} for v in varieties]},
+            "est_kb": 40 + {"period": cells * 35, "matrix": cells * 22}.get(kind, photos * EST_KB_PER_PHOTO),
+            # Vista previa visual: fichas (semanal / por variedad) y mapa de estados.
+            "week_labels": [ph.week_short(w) for w in weeks],
+            "rows": [{"variety_id": v["id"], "name": v["name"], "cultivar": v.get("cultivar") or "",
+                      "sector": v.get("sector"), "irrigation": v.get("irrigation"),
+                      "plant_year": v.get("plant_year"), "code": v.get("code") or "",
+                      "cells": detail[v["id"]]} for v in varieties]}

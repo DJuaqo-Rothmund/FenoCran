@@ -1,0 +1,110 @@
+name: Android APK
+
+on:
+  push:
+    branches: ["main", "master", "claude/**"]
+    paths-ignore: ["README.md"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Dependencias del núcleo
+        run: pip install jinja2 pillow numpy pypdf pytest
+      - name: Pruebas (BD, semanas, IA, PIN, recordatorios, informes)
+        run: pytest -q
+
+  apk:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git zip unzip autoconf libtool pkg-config zlib1g-dev \
+            libncurses-dev cmake libffi-dev libssl-dev automake libltdl-dev build-essential ccache lld
+      - name: Buildozer
+        run: pip install "cython<3.1" buildozer==1.6.0 setuptools
+      # Solo se cachea el SDK/NDK (~/.buildozer), no las compilaciones del proyecto,
+      # para no arrastrar estados rotos entre ejecuciones. Se guarda aunque falle.
+      - name: Restaurar caché de SDK/NDK
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-sdk-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: buildozer-sdk-${{ runner.os }}-
+      # Firma estable: Google Drive (OAuth) reconoce la app por su huella SHA-1,
+      # así que todas las compilaciones usan la misma clave de depuración del repo.
+      - name: Clave de firma estable
+        run: |
+          mkdir -p ~/.android
+          cp android/debug.keystore ~/.android/debug.keystore
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android | grep -E "SHA1|SHA256"
+      # Versión creciente en cada compilación (1.1.<n.º de ejecución>): Android la
+      # instala como ACTUALIZACIÓN encima de la anterior, conservando los datos.
+      - name: Número de versión
+        run: |
+          VERSION="1.1.${{ github.run_number }}"
+          sed -i "s/^version = .*/version = $VERSION/" buildozer.spec
+          echo "$VERSION" > version.txt
+          echo "Versión: $VERSION"
+      # freetype se descarga de download.savannah.gnu.org, que a veces no responde desde
+      # GitHub («Network is unreachable»). Se deja el archivo ya descargado (de un espejo
+      # si hace falta) donde python-for-android lo busca, con su marca de «descargado».
+      - name: Fuentes de freetype (con espejos)
+        run: |
+          V=2.14.1; F=freetype-$V.tar.gz
+          D=.buildozer/android/platform/build-arm64-v8a/packages/freetype
+          mkdir -p "$D"
+          for URL in \
+            "https://download-mirror.savannah.gnu.org/releases/freetype/$F" \
+            "https://downloads.sourceforge.net/project/freetype/freetype2/$V/$F" \
+            "https://download.savannah.gnu.org/releases/freetype/$F"; do
+            if curl -fsSL --retry 2 --connect-timeout 20 --max-time 180 -o "$D/$F" "$URL" \
+               && tar -tzf "$D/$F" > /dev/null; then
+              touch "$D/.mark-$F"; echo "freetype desde $URL"; break
+            fi
+            rm -f "$D/$F"
+          done
+          ls -la "$D"
+      - name: Compilar APK (debug)
+        run: yes | buildozer -v android debug
+      # Firma explícita con la clave del repositorio y verificación: garantiza que
+      # cada APK se pueda instalar como ACTUALIZACIÓN (misma firma) y que Google
+      # Drive reconozca la app (SHA-1 registrado). Si no coincide, falla la compilación.
+      - name: Firmar con la clave del repositorio y verificar
+        run: |
+          BT=$(ls -d ~/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
+          APK=$(ls bin/*.apk | head -1)
+          "$BT/zipalign" -f -p 4 "$APK" /tmp/aligned.apk
+          "$BT/apksigner" sign --ks android/debug.keystore --ks-pass pass:android \
+            --ks-key-alias androiddebugkey --key-pass pass:android --out "$APK" /tmp/aligned.apk
+          "$BT/apksigner" verify --print-certs "$APK" | tee /tmp/certs.txt
+          grep -qi "SHA-1 digest: edb0585ce094df75d479d547c10cc0810ef04038" /tmp/certs.txt
+          "$BT/aapt" dump badging "$APK" | head -1 || true
+      - name: Guardar caché de SDK/NDK
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-sdk-${{ runner.os }}-${{ github.run_id }}
+      - name: Publicar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fenocran-apk
+          path: bin/*.apk
+          if-no-files-found: error

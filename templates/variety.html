@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% from "_macros.html" import geo_line, bbch_chip, photo, photo_pair, ai_line, compare_chart, attach_gallery, measures_block %}
+{% block meta %}{% if variety.code %}<span>Código: {{ variety.code }}</span>{% endif %}<span>{{ timeline|length }} semanas registradas</span>{% endblock %}
+{% block content %}
+<h2>Parámetros biométricos y productivos</h2>
+<div class="stats">
+  <div class="card stat"><div><span class="v">{{ metrics.historical_yield|num }}</span><span class="u">{{ metrics.historical_yield_unit }}</span></div><div class="l">Rendimiento histórico</div></div>
+  <div class="card stat"><div><span class="v">{{ metrics.projected_yield|num }}</span><span class="u">{{ metrics.projected_yield_unit }}</span></div><div class="l">Proyección temporada</div></div>
+  <div class="card stat"><div><span class="v">{{ metrics.basal_canes|num }}</span><span class="u">{{ metrics.basal_canes_unit }}</span></div><div class="l">Verticales</div></div>
+  <div class="card stat"><div><span class="v">{{ metrics.laterals|num }}</span><span class="u">{{ metrics.laterals_unit }}</span></div><div class="l">Flores por vertical</div></div>
+</div>
+{% if metrics.historical_note %}<p class="small muted">Nota rendimiento histórico: {{ metrics.historical_note }}</p>{% endif %}
+{% if custom %}
+<div class="scroll-x" style="margin-top: 10px;">
+<table>
+  <thead><tr><th>Parámetro adicional</th><th>Valor</th><th>Unidad</th></tr></thead>
+  <tbody>{% for f in custom %}<tr><td>{{ f.key }}</td><td class="mono">{{ f.value }}</td><td class="muted">{{ f.unit }}</td></tr>{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+
+{% if attachments %}
+<h2>Fotos adjuntas generales</h2>
+{{ attach_gallery(attachments) }}
+{% endif %}
+
+<h2>Progresión fenológica</h2>
+{% if chart %}
+{% if compare %}{{ compare_chart(compare, "cmp-variety") }}{% else %}<div class="card" style="padding: 12px;">{{ chart|safe }}</div>{% endif %}
+<div class="scroll-x" style="margin-top: 12px;">
+<table>
+  <thead><tr>{% for m in milestones %}<th>{{ m.name }} (≥{{ m.code|code }})</th>{% endfor %}</tr></thead>
+  <tbody><tr>{% for m in milestones %}<td>{% if m.week %}Semana {{ m.week }}{% else %}<span class="muted">—</span>{% endif %}</td>{% endfor %}</tr></tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">Aún no hay estados fenológicos registrados para esta variedad.</p>
+{% endif %}
+
+<h2>Timeline de brotación a cosecha</h2>
+<div class="timeline">
+{% for t in timeline %}
+  <div class="tl-item">
+    <div class="when">{{ t.start_date|wk }} · {{ t.week_label }}</div>
+    <div class="card tl-body">
+      <div style="display:flex; flex-direction:column; gap:8px; min-width:0;">
+        {{ photo_pair(t.img) }}
+        {% if t.extras %}<div class="extras">{% for src in t.extras %}<img src="{{ src }}" alt="Foto adicional" loading="lazy">{% endfor %}</div>{% endif %}
+      </div>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <div>{{ bbch_chip(t.code) }}</div>
+        {% if t.code is not none %}<div class="small muted">{{ macro_name(t.code) }}</div>{% endif %}
+        {{ ai_line(t) }}
+        {{ geo_line(t) }}
+        {% if t.notes %}<div class="notes">{{ t.notes }}</div>{% endif %}
+        {{ attach_gallery(t.attachments) }}
+      </div>
+    </div>
+  </div>
+{% else %}
+  <p class="muted">Sin registros.</p>
+{% endfor %}
+</div>
+{% if measures %}
+<h2>Mediciones</h2>
+{{ measures_block(measures, show_week=True, show_variety=False) }}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,133 @@
+[app]
+
+# (str) Title of your application
+title = FenoCran
+
+# (str) Package name / domain  ->  org.cran.fenocran
+# (notifications.SERVICE_CLASS depende de este nombre: org.cran.fenocran.ServiceReminder)
+package.name = fenocran
+package.domain = org.cran
+
+# (str) Source code where the main.py live
+source.dir = .
+
+# (list) Source files to include
+source.include_exts = py,png,jpg,kv,atlas,html,json,tflite,txt
+
+# (list) Directories / files to exclude
+source.exclude_dirs = tests, bin, .buildozer, .git, __pycache__, .pytest_cache
+source.exclude_patterns = tools/demo_data.py, tools/export_mobilenet_tflite.py, tools/make_berries.py, tools/make_maps.py, tools/make_splash_layers.py, tools/make_splash_lottie.py, tools/make_cran_art.py, assets/splash_lottie.json, README.md
+
+# (str) Application versioning
+version = 1.0.0
+
+# (list) Application requirements
+# - kivymd se fija en 1.2.0 (API estable usada por ui/).
+# - numpy y pillow tienen receta p4a; jinja2/markupsafe/pypdf/plyer son puros Python.
+# - Para usar el extractor MobileNetV3 (TFLite) agregar: tflite-runtime
+#   y copiar el modelo en assets/models/ (ver tools/export_mobilenet_tflite.py).
+requirements = python3,kivy==2.3.1,kivymd==1.2.0,pillow,numpy,jinja2,markupsafe,plyer,pyjnius,android,pypdf,sqlite3,openssl,certifi
+
+# (str) Presplash / icon
+presplash.filename = %(source.dir)s/assets/presplash.png
+# Pantalla de carga ANIMADA (Lottie, la dibuja Android mientras arranca Python y la app
+# precarga; ver tools/make_splash_lottie.py y splash_native.py). presplash.png queda de
+# respaldo si no se pudiera usar.
+android.presplash_lottie = %(source.dir)s/assets/splash_lottie.json
+icon.filename = %(source.dir)s/assets/icon.png
+android.presplash_color = #F2F4EE
+
+# (list) Supported orientations
+orientation = portrait
+
+# (list) Services: servicio en primer plano de corta duración que publica el
+# recordatorio semanal cuando lo dispara AlarmManager (funciona con la app cerrada).
+services = Reminder:service/reminder_service.py:foreground:foregroundServiceType=shortService
+
+fullscreen = 0
+
+#
+# Android specific
+#
+
+# (list) Permissions
+# - CAMERA: captura directa.
+# - READ_EXTERNAL_STORAGE / WRITE_EXTERNAL_STORAGE (<= Android 9-12) y
+#   READ_MEDIA_IMAGES (Android 13+): galería y guardado local.
+# - POST_NOTIFICATIONS, WAKE_LOCK, SCHEDULE_EXACT_ALARM: alarmas semanales precisas.
+# - USE_EXACT_ALARM (Android 13+): concede alarmas exactas sin ajuste manual.
+#   ¡Quitarla si la app se publicará en Google Play (política restringida a apps de alarma/calendario)!
+# - FOREGROUND_SERVICE: servicio de recordatorio.
+# - INTERNET / ACCESS_NETWORK_STATE: respaldo de fotos en Google Drive (solo Wi-Fi opcional).
+# - ACCESS_FINE/COARSE_LOCATION: ubicación GPS opcional de cada muestra (se pide al usarla).
+# - ACCESS_MEDIA_LOCATION: leer las coordenadas GPS guardadas en las fotos de la galería.
+android.permissions = INTERNET,
+    ACCESS_FINE_LOCATION,
+    ACCESS_COARSE_LOCATION,
+    ACCESS_MEDIA_LOCATION,
+    ACCESS_NETWORK_STATE,
+    CAMERA,
+    (name=android.permission.READ_EXTERNAL_STORAGE;maxSdkVersion=32),
+    (name=android.permission.WRITE_EXTERNAL_STORAGE;maxSdkVersion=28),
+    READ_MEDIA_IMAGES,
+    POST_NOTIFICATIONS,
+    WAKE_LOCK,
+    SCHEDULE_EXACT_ALARM,
+    USE_EXACT_ALARM,
+    FOREGROUND_SERVICE,
+    VIBRATE
+
+# (int) Target Android API / minimum API
+android.api = 34
+android.minapi = 26
+
+# (bool) Accept SDK license automatically (necesario en Colab / CI)
+android.accept_sdk_license = True
+
+# (list) The Android archs to build for
+# Solo arm64-v8a (teléfonos de 64 bits, prácticamente todos desde 2017).
+# Compilar dos arquitecturas en una misma pasada rompe el entorno virtual de pip
+# de python-for-android (reutiliza «venv» y mezcla dos versiones de pip).
+# Para teléfonos antiguos de 32 bits, compilar aparte con: android.archs = armeabi-v7a
+android.archs = arm64-v8a
+
+# (str) XML extra dentro de <manifest>: <queries> para ver WhatsApp y apps de correo
+# (visibilidad de paquetes de Android 11+) al enviar informes.
+android.extra_manifest_xml = ./android/extra_manifest.xml
+
+# (list) Recursos Android propios y tema de la app: en Android 12+ el splash del sistema
+# (ícono en grande) queda invisible y con el color del presplash: una sola pantalla de inicio.
+android.add_resources = android/res
+
+# (list) Código Java propio: cuadro de texto nativo (teclado del teléfono con dictado y
+# autocorrector), armado en Java para no depender de llamadas sueltas desde Python.
+android.add_src = android/src
+android.apptheme = @style/PhenoTheme
+
+# (list) Dependencias Gradle: Google Identity Services (autorización de Google Drive).
+android.gradle_dependencies = com.google.android.gms:play-services-auth:21.2.0
+
+# (bool) Enable AndroidX support
+android.enable_androidx = True
+
+# (bool) Respaldo automático de Android DESACTIVADO: cada teléfono conserva su propia
+# configuración (variedades, ajustes, registros). Con él activo, al instalar la app en
+# otro teléfono con la misma cuenta de Google, Android copiaba los datos del primero.
+# Los respaldos de la app (Google Drive y copia ZIP en Descargas) no se ven afectados.
+android.allow_backup = False
+
+# (str) Bootstrap
+p4a.bootstrap = sdl2
+
+# (str) The format used to package the app for debug/release mode
+android.debug_artifact = apk
+android.release_artifact = aab
+
+[buildozer]
+
+# (int) Log level (0 = error only, 1 = info, 2 = debug (with command output))
+log_level = 2
+
+# (int) Display warning if buildozer is run as root (0 = False, 1 = True)
+# En Google Colab se ejecuta como root: se desactiva la advertencia interactiva.
+warn_on_root = 0
