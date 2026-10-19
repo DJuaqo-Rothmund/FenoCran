@@ -10,6 +10,11 @@ escala de estados del *Instructivo de estados fenológicos para el control de he
 
 * Registro semanal por **Semanas de Muestreo** (la Semana 1 se define en Ajustes; temporada junio-mayo).
 * **11 estados fenológicos** con su **criterio de control de helada** (ver sección 7).
+* **Conteo de verticales** en cada registro: se toca el estado de cada vertical revisado (un
+  toque = un vertical). La app muestra el total, cuántos hay en cada estado (y %), el estado
+  predominante, la secuencia V1, V2… (corregible), y el **control de helada del grupo** (la
+  temperatura crítica del estado más sensible presente). Va en los informes HTML y PDF y se
+  recupera al importar un PDF semanal.
 * **Registro fotográfico dual** por variedad y semana: canopia/planta completa + detalle/macro
   (cámara o galería).
 * **Sugerencia automática del estado fenológico** con IA local (Edge AI) sobre la foto de detalle.
@@ -80,6 +85,7 @@ buildozer.spec           Compilación Android (permisos, servicio, dependencias)
 | `custom_fields` | Parámetros llave-valor-unidad (ej. «Diámetro de caña (mm)», «Grados Brix»). |
 | `sampling_weeks` | Semana N, fecha de inicio y etiqueta («Semana del 14 de septiembre»). |
 | `observations` | Variedad × semana: estado (1-11), sugerencia IA (código, confianza, detalle), aceptada/corregida, notas. |
+| `uprights` | Conteo de verticales: un registro por vertical (n.º y estado 1-11) de cada observación. |
 | `photos` | Foto `canopy` y `detail` por observación (origen cámara/galería, fecha). |
 | `bbch_stages` | Escala de estados editable (base + claves importadas de documentos). |
 | `ai_references` | Embeddings etiquetados para el k-NN (few-shot). |

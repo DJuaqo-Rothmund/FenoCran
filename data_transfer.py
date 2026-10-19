@@ -553,7 +553,8 @@ def _parse_sources(db, paths: list[str]):
                     photos = {k: (lambda ref=images.get(n): ref.get_object().get_data() if ref else None)
                               for k, n in (c.get("photos") or {}).items()}
                     cards.append({"name": c.get("name", ""), "code": c.get("bbch"),
-                                  "notes": c.get("notes") or "", "photos": photos})
+                                  "notes": c.get("notes") or "", "photos": photos,
+                                  "uprights": c.get("uprights") or []})
             out.append((os.path.basename(p), week if cards else None, cards))
             continue
         for name, html, zf in _report_sources(p):
@@ -611,6 +612,11 @@ def import_reports(db, paths: list[str], progress=None) -> ReportImport:
                 fields["notes"] = notes
             if fields:
                 db.update_observation(obs["id"], **fields)
+            ups = [int(u) for u in card.get("uprights") or [] if str(u).isdigit()]
+            if ups and not db.list_uprights(obs["id"]):      # conteo de verticales
+                for u in ups:
+                    db.add_upright(obs["id"], u)
+                fields["uprights"] = len(ups)
             have = db.get_photos(obs["id"])
             missing_file = {k: p for k, p in have.items() if not os.path.exists(p["path"])}
             for kind, read in card["photos"].items():

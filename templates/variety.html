@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import geo_line, bbch_chip, photo, photo_pair, ai_line, compare_chart, attach_gallery, measures_block %}
+{% from "_macros.html" import geo_line, bbch_chip, photo, photo_pair, ai_line, compare_chart, attach_gallery, measures_block, uprights_block %}
 {% block meta %}{% if variety.code %}<span>Código: {{ variety.code }}</span>{% endif %}<span>{{ timeline|length }} semanas registradas</span>{% endblock %}
 {% block content %}
 <h2>Parámetros biométricos y productivos</h2>
@@ -50,6 +50,7 @@
       <div style="display:flex; flex-direction:column; gap:8px;">
         <div>{{ bbch_chip(t.code) }}</div>
         {% if t.code is not none %}<div class="small muted">{{ macro_name(t.code) }}</div>{% endif %}
+        {{ uprights_block(t) }}
         {{ ai_line(t) }}
         {{ geo_line(t) }}
         {% if t.notes %}<div class="notes">{{ t.notes }}</div>{% endif %}

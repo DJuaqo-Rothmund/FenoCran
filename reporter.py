@@ -322,7 +322,11 @@ class ReportGenerator:
         self.env.filters["seq"] = seq_color
         self.env.filters["date_es"] = lambda s: ph.format_date_es(_dt.date.fromisoformat(s[:10]))
         self.env.filters["num"] = self._num
-        self.env.filters["code"] = ph.code_str     # «07», «65», «89-1»
+        self.env.filters["code"] = ph.code_str     # número del estado: «5»
+        self.env.filters["pct"] = ph.pct
+        self.env.filters["upline"] = ph.upright_line
+        self.env.filters["frost"] = lambda t: ("helada: no se controla" if t is None
+                                               else f"control de helada {t:g} °C")
         self.env.filters["wk"] = ph.week_title      # «Semana 33, año 2026»
         self.env.filters["wks"] = ph.week_short     # «S33»
         self.env.globals.update(macro_name=lambda c: ph.MACRO_STAGES.get(ph.macro_of(c), ""),
@@ -496,16 +500,19 @@ class ReportGenerator:
     def _obs_ctx(self, obs: dict | None) -> dict:
         if not obs:
             return {"code": None, "notes": "", "ai_code": None, "ai_conf": None,
-                    "ai_accepted": None, "observed_at": None, "geo": None}
+                    "ai_accepted": None, "observed_at": None, "geo": None, "uprights": None,
+                    "upright_codes": []}
         geo_ = None
         if obs.get("latitude") is not None and obs.get("longitude") is not None:
             import geo
             geo_ = {"text": geo.fmt(obs["latitude"], obs["longitude"]),
                     "link": geo.osm_link(obs["latitude"], obs["longitude"]),
                     "acc": obs.get("gps_accuracy"), "source": obs.get("gps_source") or ""}
+        codes = self.db.upright_codes(obs["id"]) if obs.get("id") else []   # conteo de verticales
         return {"code": obs["bbch_code"], "notes": obs["notes"] or "",
                 "ai_code": obs["ai_code"], "ai_conf": obs["ai_confidence"],
-                "ai_accepted": obs["ai_accepted"], "observed_at": obs["observed_at"], "geo": geo_}
+                "ai_accepted": obs["ai_accepted"], "observed_at": obs["observed_at"], "geo": geo_,
+                "uprights": ph.upright_summary(codes), "upright_codes": codes}
 
     def _compare(self, heat: list[dict], weeks: list[dict], selected: list[int] | None = None):
         if len(weeks) < 2:

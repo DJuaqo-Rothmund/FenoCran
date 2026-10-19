@@ -180,6 +180,58 @@ def frost_label(code: int | None) -> str:
             else f"Control de helada: {t:g} °C")
 
 
+def frost_worst(codes) -> float | None:
+    """Temperatura de control de helada de un conjunto de verticales: la del estado MÁS
+    sensible presente (la crítica más alta). None si ninguno se controla."""
+    temps = [FROST_CRITICAL.get(int(c)) for c in codes]
+    temps = [t for t in temps if t is not None]
+    return max(temps) if temps else None
+
+
+def upright_summary(codes) -> dict | None:
+    """Conteo de verticales (un estado por vertical, en el orden en que se contaron):
+    total, cantidad y % por estado, estado predominante, rango y control de helada."""
+    codes = [int(c) for c in codes]
+    if not codes:
+        return None
+    counts: dict[int, int] = {}
+    for c in codes:
+        counts[c] = counts.get(c, 0) + 1
+    order = sorted(counts, key=_scale_value)
+    n = len(codes)
+    # Predominante: el de más verticales; en empate, el más avanzado.
+    dominant = max(order, key=lambda c: (counts[c], _scale_value(c)))
+    mean = sum(_scale_value(c) for c in codes) / n
+    return {"total": n,
+            "rows": [{"code": c, "n": counts[c], "pct": counts[c] / n} for c in order],
+            "counts": counts, "dominant": dominant,
+            "least": order[0], "most": order[-1],
+            "mean_pos": mean, "mean_code": code_from_pos(mean),
+            "frost": frost_worst(counts), "frost_label": frost_text(frost_worst(counts), counts)}
+
+
+def frost_text(temp: float | None, counts) -> str:
+    if not counts:
+        return ""
+    if temp is None:
+        return "Helada: no se controla (todas en yema apretada, resisten -7 °C)"
+    return f"Control de helada del grupo: {temp:g} °C (estado más sensible presente)"
+
+
+def pct(frac: float) -> str:
+    """0,375 -> «38 %» (redondeo comercial, no al par)."""
+    return f"{int(frac * 100 + .5)} %"
+
+
+def upright_line(summary: dict | None, top: int = 3) -> str:
+    """«20 verticales · E5 45 % · E6 30 % · E4 25 %» (los estados con más verticales)."""
+    if not summary:
+        return ""
+    rows = sorted(summary["rows"], key=lambda r: (-r["n"], -_scale_value(r["code"])))[:top]
+    parts = [f"E{r['code']} {pct(r['pct'])}" for r in rows]
+    return f"{summary['total']} verticales · " + " · ".join(parts)
+
+
 def parse_bbch_code(text: str | None) -> int | None:
     """Extrae el número de estado de textos como 'Estado 5: Elongación', 'E5' o '5'."""
     if not text:

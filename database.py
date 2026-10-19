@@ -155,6 +155,16 @@ CREATE TABLE IF NOT EXISTS observations (
     UNIQUE (variety_id, week_id)
 );
 
+-- Conteo de verticales: un registro por vertical contado, con su estado (1-11).
+CREATE TABLE IF NOT EXISTS uprights (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id  INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    idx             INTEGER NOT NULL,              -- n.º de vertical (1, 2, 3…)
+    code            INTEGER NOT NULL,              -- estado fenológico del vertical
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_uprights_obs ON uprights(observation_id, idx);
+
 CREATE TABLE IF NOT EXISTS photos (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     observation_id  INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
@@ -1117,6 +1127,54 @@ class Database:
         self.log("update", "observation", observation_id,
                  json.dumps({k: v for k, v in sets.items() if k != "ai_detail"},
                             ensure_ascii=False))
+
+    # ----------------------------------------------------- conteo de verticales
+    def list_uprights(self, observation_id: int) -> list[dict]:
+        return self.query("SELECT idx, code FROM uprights WHERE observation_id=? ORDER BY idx",
+                          (observation_id,))
+
+    def upright_codes(self, observation_id: int) -> list[int]:
+        return [r["code"] for r in self.list_uprights(observation_id)]
+
+    def add_upright(self, observation_id: int, code: int) -> int:
+        """Suma un vertical con su estado; devuelve su número (1, 2, 3…)."""
+        row = self.query_one("SELECT MAX(idx) AS m FROM uprights WHERE observation_id=?",
+                             (observation_id,))
+        idx = (row["m"] or 0) + 1
+        self.execute("INSERT INTO uprights(observation_id, idx, code, created_at) VALUES (?,?,?,?)",
+                     (observation_id, idx, int(code), _now()))
+        self.execute("UPDATE observations SET updated_at=? WHERE id=?", (_now(), observation_id))
+        return idx
+
+    def set_upright(self, observation_id: int, idx: int, code: int | None) -> None:
+        """Corrige el estado de un vertical (code=None lo quita y renumera los siguientes)."""
+        if code is None:
+            self.execute("DELETE FROM uprights WHERE observation_id=? AND idx=?", (observation_id, idx))
+            self.execute("UPDATE uprights SET idx=idx-1 WHERE observation_id=? AND idx>?",
+                         (observation_id, idx))
+        else:
+            self.execute("UPDATE uprights SET code=? WHERE observation_id=? AND idx=?",
+                         (int(code), observation_id, idx))
+        self.execute("UPDATE observations SET updated_at=? WHERE id=?", (_now(), observation_id))
+
+    def undo_upright(self, observation_id: int) -> int | None:
+        """Quita el último vertical contado; devuelve su estado (o None si no había)."""
+        row = self.query_one("SELECT idx, code FROM uprights WHERE observation_id=? "
+                             "ORDER BY idx DESC LIMIT 1", (observation_id,))
+        if row is None:
+            return None
+        self.set_upright(observation_id, row["idx"], None)
+        return row["code"]
+
+    def clear_uprights(self, observation_id: int) -> int:
+        n = len(self.list_uprights(observation_id))
+        self.execute("DELETE FROM uprights WHERE observation_id=?", (observation_id,))
+        if n:
+            self.log("delete", "uprights", observation_id, f"{n} verticales")
+        return n
+
+    def upright_summary(self, observation_id: int | None) -> dict | None:
+        return ph.upright_summary(self.upright_codes(observation_id)) if observation_id else None
 
     def previous_observation(self, variety_id: int, season: int, week_number: int) -> dict | None:
         """Última observación con BBCH de la variedad antes de `week_number`."""

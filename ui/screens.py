@@ -2530,6 +2530,7 @@ class ObservationScreen(MDScreen):
         self.suggestion = None
         self._show_ai_from_obs()
         self.refresh_location()
+        self.load_uprights()
 
     # ------------------------------------------------ ubicación (opcional)
     GPS_SOURCES = {"gps": "GPS del teléfono", "foto": "desde la foto", "mapa": "marcada en el mapa"}
@@ -2678,6 +2679,95 @@ class ObservationScreen(MDScreen):
 
     def _set_bbch(self, code: int):
         self.ids.bbch.text = ph.bbch_label(code, app().db.bbch_names())
+
+    # ----------------------------------------------- conteo de verticales
+    def load_uprights(self):
+        grid = self.ids.up_grid
+        if not grid.children:
+            for r in app().db.list_bbch():
+                bg, fg = theme.stage_colors(r["code"])
+                tap = StageTap(code=r["code"], title=f"E{ph.code_str(r['code'])}",
+                               name=ph.STAGE_NAMES.get(r["code"], r["label"]), accent=bg, fg=fg)
+                tap.bind(on_release=lambda w: self.tap_upright(w.code))
+                grid.add_widget(tap)
+        self.update_uprights()
+
+    def update_uprights(self):
+        a = app()
+        codes = a.db.upright_codes(self.obs["id"])
+        s = ph.upright_summary(codes)
+        counts = s["counts"] if s else {}
+        for tap in self.ids.up_grid.children:
+            tap.count = counts.get(tap.code, 0)
+        if not s:
+            self.ids.up_total.text = "Sin verticales contados"
+            self.ids.up_detail.text = self.ids.up_frost.text = self.ids.up_seq.text = ""
+            self.ids.up_bar.segments = []
+            return
+        names = ph.STAGE_NAMES
+        dom = s["dominant"]
+        self.ids.up_total.text = (f"{s['total']} vertical{'es' if s['total'] != 1 else ''} · "
+                                  f"predominante E{dom} {names.get(dom, '')} "
+                                  f"({ph.pct(s['counts'][dom] / s['total'])})")
+        self.ids.up_detail.text = "   ".join(f"E{r['code']}: {r['n']} ({ph.pct(r['pct'])})"
+                                            for r in s["rows"])
+        self.ids.up_frost.text = s["frost_label"]
+        self.ids.up_bar.segments = [(r["pct"], theme.stage_colors(r["code"])[0]) for r in s["rows"]]
+        last = codes[-24:]
+        start = len(codes) - len(last) + 1
+        self.ids.up_seq.text = ("… " if start > 1 else "") + " · ".join(
+            f"V{start + i}: E{cd}" for i, cd in enumerate(last))
+
+    def tap_upright(self, code: int):
+        app().db.add_upright(self.obs["id"], code)
+        self.update_uprights()      # sin aviso: el número del botón y la secuencia lo muestran
+
+    def undo_upright(self):
+        code = app().db.undo_upright(self.obs["id"])
+        self.update_uprights()
+        if code is not None:
+            app().toast(f"Quitado el último vertical (E{code})")
+
+    def edit_upright(self):
+        a = app()
+        rows = a.db.list_uprights(self.obs["id"])
+        if not rows:
+            a.toast("Aún no hay verticales contados.")
+            return
+
+        def pick(idx, code):
+            def done(new):
+                a.db.set_upright(self.obs["id"], idx, new)
+                self.update_uprights()
+            extra = [("Quitar este vertical", "Los siguientes se renumeran", lambda: done(None),
+                      c(theme.BERRY_SOFT))]
+            Clock.schedule_once(lambda *_: bbch_dialog(f"Vertical {idx}", a.db, done, extra=extra,
+                                                       current=code), .1)
+
+        pick_dialog("¿Qué vertical corrige?",
+                    [(f"Vertical {r['idx']}", ph.bbch_label(r["code"], a.db.bbch_names()),
+                      lambda r=r: pick(r["idx"], r["code"]), theme.stage_colors(r["code"])[0])
+                     for r in reversed(rows)])
+
+    def clear_uprights(self):
+        a = app()
+        n = len(a.db.list_uprights(self.obs["id"]))
+        if not n:
+            return
+
+        def go():
+            a.db.clear_uprights(self.obs["id"])
+            self.update_uprights()
+        confirm("Borrar conteo", f"Se borran los {n} verticales contados en este registro.",
+                [("Borrar", go)])
+
+    def use_dominant(self):
+        s = app().db.upright_summary(self.obs["id"])
+        if not s:
+            app().toast("Cuente algunos verticales primero.")
+            return
+        self._set_bbch(s["dominant"])
+        app().toast("Estado fenológico = predominante del conteo (recuerde Guardar).")
 
     @staticmethod
     def frost_text(text: str) -> str:
@@ -2939,6 +3029,41 @@ class ProgressRing(Widget):
 def _muted_label(text: str):
     return MDLabel(text=text, font_style="Caption", adaptive_height=True, halign="center",
                    theme_text_color="Custom", text_color=c(theme.MUTED))
+
+
+class StageTap(ButtonBehavior, GlassCard):
+    """Botón de un estado en el conteo de verticales: cada toque suma un vertical."""
+    code = NumericProperty(0)
+    title = StringProperty()
+    name = StringProperty()
+    count = NumericProperty(0)
+    accent = ColorProperty(c(theme.LEAF_SOFT))
+    fg = ColorProperty(c(theme.INK))
+
+
+class UprightBar(Widget):
+    """Barra apilada con la proporción de verticales por estado (color de su estadio)."""
+    segments = ListProperty([])   # [(fracción, rgba)]
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bind(pos=self._draw, size=self._draw, segments=self._draw)
+
+    def _draw(self, *_):
+        from kivy.graphics import Color, Line, RoundedRectangle
+        self.canvas.clear()
+        if not self.segments:
+            return
+        with self.canvas:
+            x = self.x
+            for i, (frac, rgba) in enumerate(self.segments):
+                w = self.width * frac
+                Color(*rgba[:3], 1)
+                RoundedRectangle(pos=(x, self.y), size=(max(w - dp(1), 0), self.height),
+                                 radius=[dp(4)])
+                x += w
+            Color(*c(theme.LEAF_DARK, .25))
+            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(4)), width=dp(.8))
 
 
 class StageChip(BoxLayout):

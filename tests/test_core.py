@@ -1695,3 +1695,49 @@ def test_photo_optimizer_keeps_paths(db, tmp_path):
     new = store_photo(big, str(tmp_path / "out"), "x")
     with Image.open(new) as im:
         assert max(im.size) <= 1600
+
+
+def test_upright_count_states_frost_and_reports(db, tmp_path):
+    """Conteo de verticales: un estado por vertical, resumen (%, predominante, helada),
+    corrección/deshacer, informes HTML y PDF, y recuperación desde el PDF semanal."""
+    from data_transfer import import_reports
+    s = ph.upright_summary([5, 5, 6, 4, 5, 6, 7, 1])
+    assert s["total"] == 8 and s["dominant"] == 5 and s["least"] == 1 and s["most"] == 7
+    assert [(r["code"], r["n"]) for r in s["rows"]] == [(1, 1), (4, 1), (5, 3), (6, 2), (7, 1)]
+    assert s["frost"] == 0 and "0 °C" in s["frost_label"]
+    assert ph.upright_line(s) == "8 verticales · E5 38 % · E6 25 % · E7 13 %"
+    assert ph.upright_summary([1, 1])["frost"] is None                # yema apretada: no se controla
+    assert ph.upright_summary([2, 8, 11])["frost"] == 1                # flor: la más sensible
+    assert ph.upright_summary([5, 6])["dominant"] == 6                 # empate: la más avanzada
+    assert ph.upright_summary([]) is None
+
+    w = db.current_week(dt.date(2026, 10, 19))
+    v = db.list_varieties()[0]
+    obs = db.get_or_create_observation(v["id"], w["id"])
+    assert [db.add_upright(obs["id"], c) for c in (3, 4, 4, 5)] == [1, 2, 3, 4]
+    db.set_upright(obs["id"], 1, 4)                                    # corrige el vertical 1
+    db.set_upright(obs["id"], 2, None)                                 # quita el 2: se renumera
+    assert [(r["idx"], r["code"]) for r in db.list_uprights(obs["id"])] == [(1, 4), (2, 4), (3, 5)]
+    assert db.undo_upright(obs["id"]) == 5 and db.upright_codes(obs["id"]) == [4, 4]
+    for c in (5, 5, 5):
+        db.add_upright(obs["id"], c)
+    assert db.upright_summary(obs["id"])["dominant"] == 5
+    db.update_observation(obs["id"], bbch_code=5, bbch_label="Estado 5")
+
+    rep = ReportGenerator(db, str(tmp_path / "out"))
+    html = open(rep.weekly(w["id"]).path, encoding="utf-8").read()
+    assert "5 verticales · E5 60 % · E4 40 %" in html and 'class="upbar"' in html
+    assert "control de helada 0 °C" in html                  # E5 (0 °C) es más sensible que E4 (-1 °C)
+    pdf = rep.weekly(w["id"], package="pdf").path
+    vhtml = open(rep.variety(v["id"], w["season"]).path, encoding="utf-8").read()
+    assert "5 verticales" in vhtml
+
+    fresh = Database(str(tmp_path / "nuevo.sqlite3"))
+    import_reports(fresh, [pdf])
+    fv = next(x for x in fresh.list_varieties() if x["name"] == v["name"])
+    fobs = fresh.get_observation(fv["id"], fresh.week_for_date(dt.date(2026, 10, 19))["id"])
+    assert fresh.upright_codes(fobs["id"]) == [4, 4, 5, 5, 5]
+    import_reports(fresh, [pdf])                                       # no duplica
+    assert len(fresh.list_uprights(fobs["id"])) == 5
+    assert db.clear_uprights(obs["id"]) == 5 and db.upright_summary(obs["id"]) is None
+    fresh.close()

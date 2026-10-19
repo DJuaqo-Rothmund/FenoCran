@@ -30,6 +30,18 @@
 {% endif %}
 {%- endmacro %}
 
+{% macro uprights_block(item) -%}
+{% set u = item.uprights %}
+{% if u %}
+<div class="ups">
+  <div class="ups-h"><strong>{{ u.total }} vertical{{ 'es' if u.total != 1 else '' }}</strong> · predominante {{ u.dominant|bbch }}</div>
+  <div class="upbar" role="img" aria-label="Verticales por estado">{% for r in u.rows %}<span style="flex: {{ r.n }}; background: {{ macro_color(r.code) }}" title="Estado {{ r.code }}: {{ r.n }} ({{ r.pct|pct }})"></span>{% endfor %}</div>
+  <div class="small muted">{% for r in u.rows %}E{{ r.code }}: {{ r.n }} ({{ r.pct|pct }}){{ ' · ' if not loop.last }}{% endfor %}</div>
+  <div class="small frost">{{ u.frost_label }}</div>
+</div>
+{% endif %}
+{%- endmacro %}
+
 {% macro ai_line(item) -%}
 {% if item.ai_code is not none %}
 <div class="ai">Sugerencia IA: <strong>Estado {{ item.ai_code|code }}</strong>

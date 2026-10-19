@@ -431,7 +431,27 @@ class Report(PDFDoc):
             else:
                 self.gallery(m["pics"], cols=4)
 
+    def uprights(self, item: dict, x: float, w: float):
+        """Conteo de verticales: total, barra por estado, detalle y control de helada."""
+        u = item.get("uprights")
+        if not u:
+            return
+        dom = u["dominant"]
+        self.para(f"{u['total']} verticales · predominante E{dom} {ph.STAGE_NAMES.get(dom, '')}",
+                  8.4, INK, True, x=x, w=w)
+        self.ensure(10)
+        y, xx = self.y + 3, x
+        for r in u["rows"]:
+            ww = w * r["pct"]
+            self.rect(xx, y, max(ww - .6, .4), 6, fill=macro_color(r["code"]))
+            xx += ww
+        self.y += 10
+        self.para(" · ".join(f"E{r['code']}: {r['n']} ({ph.pct(r['pct'])})" for r in u["rows"]),
+                  7.6, MUTED, x=x, w=w)
+        self.para(u["frost_label"], 7.8, BERRY, True, x=x, w=w)
+
     def ai_geo_notes(self, item: dict, x: float, w: float):
+        self.uprights(item, x, w)
         if item.get("ai_code") is not None:
             t = f"Sugerencia IA: Estado {ph.code_str(item['ai_code'])}"
             if item.get("ai_conf") is not None:
@@ -473,9 +493,11 @@ def weekly(ctx: dict, names: dict, num=None) -> Report:
             ia = f"Estado {ph.code_str(c['ai_code'])}" + {1: " · aceptada", 0: " · corregida"}.get(c.get("ai_accepted"), "")
         rows.append([{"text": c["variety"]["name"], "bold": True},
                      ph.bbch_label(c["code"], names) if c["code"] is not None else "Sin estado",
-                     {"text": macro_name(c["code"]) or "—", "color": MUTED}, str(n), {"text": ia, "color": MUTED}])
-    r.table(["Variedad", "Estado fenológico", "Estadio principal", "Fotos", "IA"], rows,
-            [2.2, 3.6, 2.4, .8, 1.8], aligns=["left", "left", "left", "center", "left"])
+                     {"text": macro_name(c["code"]) or "—", "color": MUTED},
+                     {"text": ph.upright_line(c.get("uprights"), 2) or "—", "color": INK2},
+                     str(n), {"text": ia, "color": MUTED}])
+    r.table(["Variedad", "Estado fenológico", "Estadio principal", "Verticales", "Fotos", "IA"], rows,
+            [2.0, 3.2, 2.0, 2.6, .7, 1.6], aligns=["left", "left", "left", "left", "center", "left"])
 
     r.h2("Registro fotográfico por variedad",
          "Foto general de canopia y foto de detalle, con el estado fenológico asignado y las "
@@ -524,7 +546,8 @@ def weekly(ctx: dict, names: dict, num=None) -> Report:
     for i, c in enumerate(cards):
         names_map = r.keep(lambda i=i, c=c: draw_card(i, c))   # la tarjeta entera en una hoja
         data_cards.append({"name": c["variety"]["name"], "code": c["variety"].get("code") or "",
-                           "bbch": c["code"], "notes": c.get("notes") or "", "photos": names_map})
+                           "bbch": c["code"], "notes": c.get("notes") or "", "photos": names_map,
+                           "uprights": c.get("upright_codes") or []})
     if ctx.get("measures"):
         r.h2("Mediciones de la semana")
         r.measures(ctx["measures"])
