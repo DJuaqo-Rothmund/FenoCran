@@ -2224,6 +2224,15 @@
                         spacing: dp(6)
                     Muted:
                         id: up_seq
+                    GhostButton:
+                        icon: "camera-plus-outline"
+                        text: "Contar desde una foto (la IA sugiere)"
+                        on_release: root.count_from_photo()
+                    MDBoxLayout:
+                        id: up_photos
+                        orientation: "vertical"
+                        adaptive_height: True
+                        spacing: dp(6)
                     MDGridLayout:
                         cols: 2
                         adaptive_height: True
@@ -3035,6 +3044,18 @@
                                 icon: "image-search-outline"
                                 text: "Elegir foto y analizar"
                                 on_release: root.try_photo()
+                        MindCard:
+                            MindSection:
+                                text: "VERTICALES EN FOTOS"
+                            MindMuted:
+                                id: upright_ai_text
+                                text: ""
+                            MindMuted:
+                                text: "Cada foto de conteo aceptada enseña a la IA dónde están los verticales y su estado (fondo blanco, de lado y desde arriba). Con unas 200-400 fotos marcadas, exporte el set y entrene el detector (tools/train_upright_detector.py): copie verticales.tflite en la carpeta «models» de la app."
+                            MindGhost:
+                                icon: "package-down"
+                                text: "Exportar fotos marcadas (set YOLO)"
+                                on_release: root.export_uprights()
                         MindCard:
                             MindSection:
                                 text: "COMPARTIR CON OTRO TELÉFONO"

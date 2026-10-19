@@ -22,7 +22,7 @@ from kivy.properties import (BooleanProperty, ColorProperty, ListProperty, Numer
                              ObjectProperty, StringProperty)
 from kivymd.app import MDApp
 from kivymd.uix.boxlayout import MDBoxLayout
-from kivymd.uix.button import MDFlatButton, MDRaisedButton, MDRectangleFlatButton
+from kivymd.uix.button import MDFlatButton, MDIconButton, MDRaisedButton, MDRectangleFlatButton
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.fitimage import FitImage
 from kivymd.uix.label import MDIcon, MDLabel
@@ -2531,6 +2531,7 @@ class ObservationScreen(MDScreen):
         self._show_ai_from_obs()
         self.refresh_location()
         self.load_uprights()
+        self.load_count_photos()
 
     # ------------------------------------------------ ubicación (opcional)
     GPS_SOURCES = {"gps": "GPS del teléfono", "foto": "desde la foto", "mapa": "marcada en el mapa"}
@@ -2717,6 +2718,109 @@ class ObservationScreen(MDScreen):
         start = len(codes) - len(last) + 1
         self.ids.up_seq.text = ("… " if start > 1 else "") + " · ".join(
             f"V{start + i}: E{cd}" for i, cd in enumerate(last))
+
+    def load_count_photos(self):
+        """Fotos de conteo del registro: miniatura, tipo, n.º de verticales y estado."""
+        import upright_ai as ua
+        a = app()
+        box = self.ids.up_photos
+        fast_clear(box)
+        for i, cp in enumerate(a.db.list_count_photos(self.obs["id"]), 1):
+            row = CountPhotoRow(orientation="horizontal", size_hint_y=None, height=dp(64),
+                                padding=(dp(6), dp(6)), spacing=dp(10), radius=[dp(14)],
+                                md_bg_color=c("#FFFFFF", .6), line_color=c(theme.LINE))
+            row.add_widget(thumb_widget(cp["path"], 160))
+            state = "aceptado" if cp["accepted"] else "por revisar"
+            row.add_widget(MDLabel(
+                text=f"[b]Foto {i} · {ua.MODES[cp['mode']][0]}[/b]\n"
+                     f"{cp['n_marks']} verticales · {state}", markup=True, font_style="Caption",
+                theme_text_color="Custom", text_color=c(theme.INK)))
+            trash = MDIconButton(icon="delete-outline", theme_icon_color="Custom",
+                                 icon_color=c(theme.MUTED), size_hint_x=None, width=dp(40))
+            trash.bind(on_release=lambda w, cp=cp: self.delete_count_photo(cp))
+            row.add_widget(trash)
+            row.bind(on_release=lambda w, cp=cp: a.open_marker(cp["id"], suggest=False))
+            box.add_widget(row)
+
+    def delete_count_photo(self, cp: dict):
+        a = app()
+
+        def go():
+            a.db.delete_count_photo(cp["id"])
+            a.db.forget_upright_refs(cp["path"])
+            a.__dict__.get("upright_ai") and a.upright_ai.invalidate()
+            self.update_uprights()
+            self.load_count_photos()
+        confirm("Quitar foto de conteo",
+                "Se quitan la foto y los verticales que aportó al conteo (el archivo queda en "
+                "el teléfono).", [("Quitar", go)])
+
+    def count_from_photo(self):
+        """Elegir el tipo de foto (los 3 sirven) y tomarla o subirla de la galería."""
+        import upright_ai as ua
+        a = app()
+        learned = a.db.upright_ref_counts()
+        items = []
+        for mode, (title, tip) in ua.MODES.items():
+            n = learned[mode]["verticales"]
+            ia = (f"IA: aprendió {n} verticales en {learned[mode]['fotos']} fotos" if n else
+                  "IA: aún sin ejemplos de este tipo")
+            items.append((title + (" (recomendado)" if mode == "board" else ""), f"{tip}\n{ia}",
+                          lambda mode=mode: Clock.schedule_once(lambda *_: self._count_source(mode), .1)))
+        pick_dialog("¿Qué tipo de foto?", items)
+
+    def _count_source(self, mode: str):
+        pick_dialog("Foto de conteo", [
+            ("Tomar foto", "Con la cámara", lambda: self._capture_count(mode, "camera")),
+            ("Elegir de la galería", "Una o varias fotos", lambda: self._capture_count(mode, "gallery"))])
+
+    def _capture_count(self, mode: str, source: str):
+        a = app()
+        obs_id = self.obs["id"]
+
+        def done(result, origin):
+            paths = [p for p in (result if isinstance(result, list) else [result]) if p]
+            if not paths:
+                if origin == "error":
+                    a.toast("No se pudo obtener la foto.")
+                return
+            season, n = self.week["season"], self.week["week_number"]
+
+            def work():
+                ids, error = [], None
+                try:
+                    dest_dir = data_subdir("photos", f"T{season}", f"S{n:02d}")
+                    base = ph.photo_basename(self.variety, self.week["start_date"], "count",
+                                             trial=a.db.code)
+                    for tmp in paths:
+                        path = store_photo(tmp, dest_dir, base, exact=True)
+                        ids.append(a.db.add_count_photo(obs_id, path, mode, source=origin))
+                        a.thumb(path, 160)
+                        a.backup_extra(path, self.week["start_date"], "Conteo de verticales")
+                except Exception as exc:  # noqa: BLE001
+                    error = exc
+                Clock.schedule_once(lambda *_: stored(ids, error))
+
+            def stored(ids, error):
+                if self.obs["id"] != obs_id:
+                    return
+                self.load_count_photos()
+                if error:
+                    a.toast(f"No se pudo guardar la foto: {error}")
+                elif ids:
+                    a.open_marker(ids[0])
+                    if len(ids) > 1:
+                        a.toast(f"{len(ids)} fotos agregadas: revise cada una desde la lista")
+
+            a.workers.submit(work)
+
+        if source == "camera":
+            seq = len(a.db.list_count_photos(obs_id)) + 1
+            hint = ph.photo_basename(self.variety, self.week["start_date"], "count", seq,
+                                     trial=a.db.code)
+            a.media.take_photo(done, hint, exact=True)
+        else:
+            a.media.pick_images(done)
 
     def tap_upright(self, code: int):
         app().db.add_upright(self.obs["id"], code)
@@ -3039,6 +3143,10 @@ class StageTap(ButtonBehavior, GlassCard):
     count = NumericProperty(0)
     accent = ColorProperty(c(theme.LEAF_SOFT))
     fg = ColorProperty(c(theme.INK))
+
+
+class CountPhotoRow(ButtonBehavior, GlassCard):
+    """Fila de una foto de conteo (tocarla abre sus recuadros)."""
 
 
 class UprightBar(Widget):
@@ -4683,6 +4791,35 @@ class AILabScreen(MDScreen):
                                    value=str(counts[code])))
         if not counts:
             box.add_widget(_mind("MindMuted", text="Sin referencias: la IA usa solo los priors agronómicos."))
+        import upright_ai as ua
+        up = a.db.upright_ref_counts()
+        lines = [f"{ua.MODES[m][0]}: {up[m]['verticales']} verticales en {up[m]['fotos']} fotos"
+                 + ("" if m == "board" or up[m]["verticales"] >= ua.MIN_POS else
+                    f" (sugiere desde {ua.MIN_POS})") for m in ua.MODES]
+        model = "detector entrenado cargado" if a.upright_ai.detector else "sin detector entrenado"
+        self.ids.upright_ai_text.text = "\n".join(lines + [f"Modelo: {model}"])
+
+    def export_uprights(self):
+        a = app()
+        a.toast("Preparando el set de fotos marcadas…")
+
+        def work():
+            try:
+                import upright_ai as ua
+                from platform_utils import data_subdir as _ds
+                dest = os.path.join(_ds("exports"), f"verticales_yolo_{_dt.date.today():%Y%m%d}.zip")
+                res = ua.export_yolo(a.all_dbs(), dest)
+                if not res["images"]:
+                    Clock.schedule_once(lambda *_: a.toast("Aún no hay fotos de conteo aceptadas."))
+                    return
+                Clock.schedule_once(lambda *_: a.report_actions(
+                    dest, "Set de verticales (YOLO)",
+                    f"{res['images']} fotos · {res['boxes']} verticales marcados", viewable=False))
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                Clock.schedule_once(lambda *_: a.toast(f"No se pudo exportar: {error}"))
+
+        a.workers.submit(work)
 
     def evaluate(self):
         ev = app().classifier.evaluate()

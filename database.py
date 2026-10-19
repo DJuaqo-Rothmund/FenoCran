@@ -165,6 +165,41 @@ CREATE TABLE IF NOT EXISTS uprights (
 );
 CREATE INDEX IF NOT EXISTS idx_uprights_obs ON uprights(observation_id, idx);
 
+-- Fotos para contar verticales (3 tipos: fondo blanco, de lado, desde arriba) y sus
+-- recuadros: uno por vertical, con su estado. Las coordenadas van de 0 a 1 (x, y = esquina
+-- superior izquierda del recuadro sobre la foto).
+CREATE TABLE IF NOT EXISTS count_photos (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id  INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    path            TEXT NOT NULL,
+    mode            TEXT NOT NULL CHECK (mode IN ('board', 'side', 'top')),
+    source          TEXT DEFAULT 'camera',
+    captured_at     TEXT NOT NULL,
+    accepted        INTEGER NOT NULL DEFAULT 0      -- 1 = conteo aceptado (va a uprights)
+);
+CREATE TABLE IF NOT EXISTS photo_marks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    count_photo_id  INTEGER NOT NULL REFERENCES count_photos(id) ON DELETE CASCADE,
+    x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+    code            INTEGER NOT NULL,               -- estado del vertical (1-11)
+    origin          TEXT NOT NULL DEFAULT 'user',   -- user | ai (sugerido y aceptado tal cual)
+    created_at      TEXT NOT NULL
+);
+
+-- Memoria de la IA de verticales (en la base común): recortes de verticales marcados
+-- (code 1-11) y de fondo (code 0), por tipo de foto.
+CREATE TABLE IF NOT EXISTS upright_refs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode        TEXT NOT NULL,
+    code        INTEGER NOT NULL,
+    extractor   TEXT NOT NULL,
+    embedding   BLOB NOT NULL,
+    w           REAL, h REAL,                       -- tamaño del recuadro (0-1)
+    image_path  TEXT,
+    workspace   TEXT,
+    created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS photos (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     observation_id  INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
@@ -324,6 +359,7 @@ class Database:
                       ("treatment", "INTEGER"), ("rep", "INTEGER"),   # parcela T1R1…
                       ("cultivar", "TEXT"),                           # predio: variedad de la unidad
                       ("plant_year", "INTEGER")],                     # predio: año de plantación
+        "uprights": [("count_photo_id", "INTEGER")],                   # vertical marcado en una foto
         "observations": [("latitude", "REAL"), ("longitude", "REAL"),
                          ("gps_accuracy", "REAL"), ("gps_source", "TEXT")],
         "sampling_weeks": [("skipped", "INTEGER NOT NULL DEFAULT 0")],   # semana no muestreada
@@ -1136,13 +1172,13 @@ class Database:
     def upright_codes(self, observation_id: int) -> list[int]:
         return [r["code"] for r in self.list_uprights(observation_id)]
 
-    def add_upright(self, observation_id: int, code: int) -> int:
+    def add_upright(self, observation_id: int, code: int, count_photo_id: int | None = None) -> int:
         """Suma un vertical con su estado; devuelve su número (1, 2, 3…)."""
         row = self.query_one("SELECT MAX(idx) AS m FROM uprights WHERE observation_id=?",
                              (observation_id,))
         idx = (row["m"] or 0) + 1
-        self.execute("INSERT INTO uprights(observation_id, idx, code, created_at) VALUES (?,?,?,?)",
-                     (observation_id, idx, int(code), _now()))
+        self.execute("INSERT INTO uprights(observation_id, idx, code, created_at, count_photo_id) "
+                     "VALUES (?,?,?,?,?)", (observation_id, idx, int(code), _now(), count_photo_id))
         self.execute("UPDATE observations SET updated_at=? WHERE id=?", (_now(), observation_id))
         return idx
 
@@ -1172,6 +1208,113 @@ class Database:
         if n:
             self.log("delete", "uprights", observation_id, f"{n} verticales")
         return n
+
+    def _renumber_uprights(self, observation_id: int) -> None:
+        rows = self.query("SELECT id FROM uprights WHERE observation_id=? ORDER BY idx, id",
+                          (observation_id,))
+        for i, r in enumerate(rows, 1):
+            self.execute("UPDATE uprights SET idx=? WHERE id=?", (i, r["id"]))
+
+    # ------------------------------------------- fotos de conteo y sus recuadros
+    COUNT_MODES = ("board", "side", "top")
+
+    def add_count_photo(self, observation_id: int, path: str, mode: str,
+                        source: str = "camera") -> int:
+        if mode not in self.COUNT_MODES:
+            raise ValueError(f"Tipo de foto desconocido: {mode}")
+        cur = self.execute("INSERT INTO count_photos(observation_id, path, mode, source, captured_at) "
+                           "VALUES (?,?,?,?,?)", (observation_id, path, mode, source, _now()))
+        return cur.lastrowid
+
+    def get_count_photo(self, count_photo_id: int) -> dict | None:
+        return self.query_one("SELECT * FROM count_photos WHERE id=?", (count_photo_id,))
+
+    def list_count_photos(self, observation_id: int) -> list[dict]:
+        return self.query("SELECT cp.*, (SELECT COUNT(*) FROM photo_marks m "
+                          "WHERE m.count_photo_id=cp.id) AS n_marks FROM count_photos cp "
+                          "WHERE observation_id=? ORDER BY id", (observation_id,))
+
+    def list_marks(self, count_photo_id: int) -> list[dict]:
+        return self.query("SELECT id, x, y, w, h, code, origin FROM photo_marks "
+                          "WHERE count_photo_id=? ORDER BY id", (count_photo_id,))
+
+    def set_marks(self, count_photo_id: int, marks: list[dict]) -> int:
+        """Reemplaza los recuadros de la foto (orden: de izquierda a derecha y de arriba
+        abajo, así V1, V2… siguen la lectura de la foto)."""
+        marks = sorted(marks, key=lambda m: (round(m["x"] + m["w"] / 2, 2), m["y"]))
+        self.execute("DELETE FROM photo_marks WHERE count_photo_id=?", (count_photo_id,))
+        now = _now()
+        for m in marks:
+            clip = lambda v: min(1.0, max(0.0, float(v)))  # noqa: E731
+            self.execute("INSERT INTO photo_marks(count_photo_id, x, y, w, h, code, origin, created_at) "
+                         "VALUES (?,?,?,?,?,?,?,?)",
+                         (count_photo_id, clip(m["x"]), clip(m["y"]), clip(m["w"]), clip(m["h"]),
+                          int(m["code"]), m.get("origin") or "user", now))
+        return len(marks)
+
+    def accept_count_photo(self, count_photo_id: int) -> int:
+        """El conteo de la foto pasa al registro: sus verticales reemplazan a los que esa
+        misma foto había aportado antes (los contados a mano o de otras fotos se mantienen)."""
+        cp = self.get_count_photo(count_photo_id)
+        if cp is None:
+            return 0
+        obs = cp["observation_id"]
+        self.execute("DELETE FROM uprights WHERE count_photo_id=?", (count_photo_id,))
+        self._renumber_uprights(obs)
+        marks = self.list_marks(count_photo_id)
+        for m in marks:
+            self.add_upright(obs, m["code"], count_photo_id=count_photo_id)
+        self.execute("UPDATE count_photos SET accepted=1 WHERE id=?", (count_photo_id,))
+        self.log("update", "count_photo", count_photo_id, f"{len(marks)} verticales")
+        return len(marks)
+
+    def delete_count_photo(self, count_photo_id: int) -> None:
+        """Quita la foto del registro con los verticales que aportó (el archivo queda)."""
+        cp = self.get_count_photo(count_photo_id)
+        if cp is None:
+            return
+        self.execute("DELETE FROM uprights WHERE count_photo_id=?", (count_photo_id,))
+        self.execute("DELETE FROM count_photos WHERE id=?", (count_photo_id,))
+        self._renumber_uprights(cp["observation_id"])
+
+    def marked_count_photos(self) -> list[dict]:
+        """Fotos de conteo aceptadas con sus recuadros (para exportar el set de entrenamiento)."""
+        rows = self.query("SELECT * FROM count_photos WHERE accepted=1 ORDER BY id")
+        for r in rows:
+            r["marks"] = self.list_marks(r["id"])
+        return [r for r in rows if r["marks"]]
+
+    # -------------------------------------------- memoria de la IA de verticales
+    def add_upright_ref(self, mode: str, code: int, extractor: str, embedding: bytes,
+                        w: float | None = None, h: float | None = None,
+                        image_path: str | None = None) -> int:
+        cur = self.ai_db.execute(
+            "INSERT INTO upright_refs(mode, code, extractor, embedding, w, h, image_path, "
+            "workspace, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (mode, int(code), extractor, embedding, w, h, image_path, self.code, _now()))
+        return cur.lastrowid
+
+    def list_upright_refs(self, extractor: str, mode: str | None = None) -> list[dict]:
+        sql, args = "SELECT * FROM upright_refs WHERE extractor=?", [extractor]
+        if mode:
+            sql += " AND mode=?"
+            args.append(mode)
+        return self.ai_db.query(sql + " ORDER BY id", args)
+
+    def forget_upright_refs(self, image_path: str) -> None:
+        self.ai_db.execute("DELETE FROM upright_refs WHERE image_path=?", (image_path,))
+
+    def upright_ref_counts(self) -> dict[str, dict]:
+        """{modo: {"verticales": n, "fondo": n, "fotos": n}}."""
+        out = {m: {"verticales": 0, "fondo": 0, "fotos": 0} for m in self.COUNT_MODES}
+        for r in self.ai_db.query("SELECT mode, code>0 AS pos, COUNT(*) AS n, "
+                                  "COUNT(DISTINCT image_path) AS f FROM upright_refs "
+                                  "GROUP BY mode, code>0"):
+            if r["mode"] in out:
+                out[r["mode"]]["verticales" if r["pos"] else "fondo"] = r["n"]
+                if r["pos"]:
+                    out[r["mode"]]["fotos"] = r["f"]
+        return out
 
     def upright_summary(self, observation_id: int | None) -> dict | None:
         return ph.upright_summary(self.upright_codes(observation_id)) if observation_id else None

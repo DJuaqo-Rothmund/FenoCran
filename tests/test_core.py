@@ -1741,3 +1741,74 @@ def test_upright_count_states_frost_and_reports(db, tmp_path):
     assert len(fresh.list_uprights(fobs["id"])) == 5
     assert db.clear_uprights(obs["id"]) == 5 and db.upright_summary(obs["id"]) is None
     fresh.close()
+
+
+def test_count_photos_marks_and_upright_ai(db, tmp_path):
+    """Conteo desde foto (3 tipos): la IA sugiere recuadros y estados, el evaluador corrige,
+    el conteo pasa al registro y la IA aprende; set YOLO para entrenar el detector."""
+    import numpy as np
+    import upright_ai as ua
+    from tools.upright_samples import make
+    w = db.current_week(dt.date(2026, 10, 19))
+    v = db.list_varieties()[0]
+    obs = db.get_or_create_observation(v["id"], w["id"])
+    ai = ua.UprightAI(db, model_dir=str(tmp_path))          # sin modelo entrenado
+
+    # Fondo blanco: cuenta desde la primera foto (segmentación).
+    path, truth = make("board", str(tmp_path / "b.jpg"), [4, 5, 5, 6, 5, 7, 4, 5, 6], 21)
+    det = ai.suggest(path, "board", week_number=9)
+    assert det.method == "segmentación" and len(det.boxes) == 9
+    assert all(b.code in ph.STAGE_POS for b in det.boxes)
+
+    # De lado: primero aprende (aún no sugiere), luego sugiere con lo aprendido.
+    side, side_truth = make("side", str(tmp_path / "s.jpg"), [5, 4, 6, 5, 5, 7, 5], 99)
+    first = ai.suggest(side, "side")
+    assert first.boxes == [] and "aprendiendo" in first.message
+    for k in range(3):
+        p, b = make("side", str(tmp_path / f"s{k}.jpg"), [4, 5, 5, 6, 7, 5, 4, 5], 10 + k)
+        assert ai.learn(p, "side", b) == 8
+    side_refs = db.upright_ref_counts()["side"]
+    assert side_refs["verticales"] == 24 and side_refs["fotos"] == 3 and side_refs["fondo"] > 20
+    det = ai.suggest(side, "side")
+    assert det.method == "aprendida" and abs(len(det.boxes) - 7) <= 1
+
+    # El evaluador corrige y acepta: los verticales pasan al registro, los manuales quedan.
+    db.add_upright(obs["id"], 8)
+    cp = db.add_count_photo(obs["id"], path, "board", "gallery")
+    marks = [b.as_dict() for b in ua.UprightAI(db, model_dir=str(tmp_path)).suggest(path, "board").boxes]
+    for m, t in zip(sorted(marks, key=lambda m: m["x"]), sorted(truth, key=lambda t: t["x"])):
+        m["code"] = t["code"]                                  # corrección del evaluador
+    assert db.set_marks(cp, marks) == 9 and db.accept_count_photo(cp) == 9
+    assert db.upright_codes(obs["id"]) == [8, 4, 5, 5, 6, 5, 7, 4, 5, 6]   # izquierda a derecha
+    assert db.accept_count_photo(cp) == 9 and len(db.list_uprights(obs["id"])) == 10   # no duplica
+    assert db.list_count_photos(obs["id"])[0]["n_marks"] == 9
+    assert ai.learn(path, "board", db.list_marks(cp)) == 9
+    assert db.upright_ref_counts()["board"]["verticales"] == 9
+    assert ai.learn(path, "board", db.list_marks(cp)) == 9       # re-aceptar no duplica
+    assert db.upright_ref_counts()["board"]["verticales"] == 9
+
+    # Exportar el set (formato YOLO: clase = estado - 1, x/y del centro, ancho, alto).
+    res = ua.export_yolo(db, str(tmp_path / "set.zip"))
+    assert res == {"images": 1, "boxes": 9, "modes": {"board": 1, "side": 0, "top": 0}}
+    with zipfile.ZipFile(tmp_path / "set.zip") as zf:
+        names = zf.namelist()
+        label = next(n for n in names if n.startswith("labels/"))
+        rows = zf.read(label).decode().split()
+        assert "data.yaml" in names and len(rows) == 9 * 5 and rows[0] == "3"
+        assert "nc: 11" in zf.read("data.yaml").decode()
+
+    # Decodificación de la salida YOLOv8 TFLite (1, 4+11, N).
+    out = np.zeros((1, 15, 3), np.float32)
+    out[0, :4, 0] = [320, 320, 64, 256]
+    out[0, 4 + 4, 0] = .9            # E5
+    out[0, :4, 1] = [330, 322, 64, 256]
+    out[0, 4 + 4, 1] = .6            # el mismo vertical: se suprime
+    out[0, 4 + 10, 2] = .1           # bajo el umbral
+    boxes = ua.decode_yolo(out)
+    assert len(boxes) == 1 and boxes[0].code == 5 and abs(boxes[0].x - .45) < 1e-6
+
+    # Quitar la foto quita sus verticales del registro (los manuales quedan).
+    db.delete_count_photo(cp)
+    assert db.upright_codes(obs["id"]) == [8]
+    assert [b for b in ua.nms([ua.Box(0, 0, .1, .1, score=1), ua.Box(.01, 0, .1, .1, score=.5)])] \
+        == [ua.Box(0, 0, .1, .1, score=1)]

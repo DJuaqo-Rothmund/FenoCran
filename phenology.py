@@ -398,7 +398,8 @@ def expected_bbch_for_week(week_number: int) -> float:
 # (fecha = inicio de la semana de muestreo; G = general/canopia, D = detalle).
 # legacy=True: fecha al revés (ddmmaaaa), formato antiguo heredado de FenoRubus.
 # ---------------------------------------------------------------------------
-PHOTO_KIND_LETTER = {"canopy": "G", "detail": "D", "attachment": "A"}   # A = adjunta a la ficha
+PHOTO_KIND_LETTER = {"canopy": "G", "detail": "D", "attachment": "A",   # A = adjunta a la ficha
+                     "count": "V"}                                         # V = conteo de verticales
 
 
 def variety_tag(name: str, code: str | None = None) -> str:

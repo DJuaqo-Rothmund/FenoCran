@@ -15,6 +15,12 @@ escala de estados del *Instructivo de estados fenológicos para el control de he
   predominante, la secuencia V1, V2… (corregible), y el **control de helada del grupo** (la
   temperatura crítica del estado más sensible presente). Va en los informes HTML y PDF y se
   recupera al importar un PDF semanal.
+* **Conteo desde una foto** (la IA sugiere, el evaluador corrige): tres tipos de foto, que se
+  pueden combinar en el mismo registro: **sobre fondo blanco** (verticales cortados y
+  separados; recomendado), **de lado** en la cama y **desde arriba** en un marco. La IA marca
+  un recuadro por vertical con su estado; se toca un recuadro y luego su estado para
+  corregir, se toca fuera para agregar uno y se arrastra para dibujarlo. Al aceptar, el
+  conteo pasa al registro y **la IA aprende de la foto** (ver sección 9).
 * **Registro fotográfico dual** por variedad y semana: canopia/planta completa + detalle/macro
   (cámara o galería).
 * **Sugerencia automática del estado fenológico** con IA local (Edge AI) sobre la foto de detalle.
@@ -86,6 +92,8 @@ buildozer.spec           Compilación Android (permisos, servicio, dependencias)
 | `sampling_weeks` | Semana N, fecha de inicio y etiqueta («Semana del 14 de septiembre»). |
 | `observations` | Variedad × semana: estado (1-11), sugerencia IA (código, confianza, detalle), aceptada/corregida, notas. |
 | `uprights` | Conteo de verticales: un registro por vertical (n.º y estado 1-11) de cada observación. |
+| `count_photos`, `photo_marks` | Fotos de conteo (tipo: fondo blanco / de lado / desde arriba) y sus recuadros (posición y estado de cada vertical). |
+| `upright_refs` | Memoria de la IA de verticales (base común): recortes marcados con su estado y trozos de fondo, por tipo de foto. |
 | `photos` | Foto `canopy` y `detail` por observación (origen cámara/galería, fecha). |
 | `bbch_stages` | Escala de estados editable (base + claves importadas de documentos). |
 | `ai_references` | Embeddings etiquetados para el k-NN (few-shot). |
@@ -324,3 +332,30 @@ variedad y los íconos a línea; luego `tools/make_ui_assets.py`, `tools/make_st
 `tools/make_splash_layers.py` y `tools/make_splash_lottie.py` generan el resto (íconos,
 fondos, presplash y animación de apertura). Para usar arte propio, reemplace
 `assets/logo_source.png` / `assets/wordmark_source.png` y vuelva a correr esos scripts.
+
+## 9. IA de verticales (conteo desde foto)
+
+`upright_ai.py`, 100 % local (numpy + Pillow):
+
+1. **Dónde están los verticales.** Con un detector entrenado (`verticales.tflite` en la
+   carpeta `models` de la app o en `assets/models/`) se usa ese modelo en los tres tipos de
+   foto. Sin modelo: en **fondo blanco**, segmentación de color (funciona desde la primera
+   foto); **de lado** y **desde arriba**, una ventana deslizante que compara cada zona con los
+   verticales y el fondo ya marcados en fotos de ese tipo (empieza a sugerir con 10
+   verticales marcados y mejora con cada foto aceptada).
+2. **Estado de cada vertical.** k-NN con los recortes marcados + priors de color y de
+   calendario del clasificador de la app.
+3. **Aprendizaje.** Cada foto aceptada guarda sus recortes (con su estado) y trozos de fondo
+   en la memoria común. En *IA › Modelo › Exportar fotos marcadas (set YOLO)* se exporta el
+   set completo; con 200-400 fotos marcadas se entrena el detector:
+
+   ```bash
+   pip install ultralytics
+   python tools/train_upright_detector.py verticales_yolo_AAAAMMDD.zip
+   # copie verticales.tflite en la carpeta «models» de la app (o en assets/models/)
+   ```
+
+   Para usar el modelo en el teléfono agregue `tflite-runtime` a `requirements` en
+   `buildozer.spec`.
+
+`tools/upright_samples.py` genera fotos sintéticas de los tres tipos (pruebas y demostración).

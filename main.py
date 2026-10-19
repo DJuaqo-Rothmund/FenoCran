@@ -164,6 +164,21 @@ class FenoCranApp(MDApp):
         return self._screen(VarietyScreen, "variety")
 
     @property
+    def marker(self):
+        from ui.marking import MarkScreen
+        return self._screen(MarkScreen, "marker")
+
+    def open_marker(self, count_photo_id: int, suggest: bool = True):
+        """Conteo de verticales sobre una foto (la IA sugiere, el evaluador corrige)."""
+        self.marker.open(count_photo_id, suggest)
+        self.go("marker")
+
+    @cached_property
+    def upright_ai(self):
+        import upright_ai  # numpy: solo al contar desde una foto
+        return upright_ai.UprightAI(self.db)
+
+    @property
     def measure(self):
         return self._screen(MeasureScreen, "measure")
 
@@ -265,7 +280,7 @@ class FenoCranApp(MDApp):
         self.workspaces.remember(ws)
         self.db = self.open_db(ws)
         self.reminders = ReminderManager(self.db)
-        for name in ("classifier", "reports", "drive", "pin"):
+        for name in ("classifier", "reports", "drive", "pin", "upright_ai"):
             self.__dict__.pop(name, None)
         self.week = self.db.current_week()
         self.season = self.week["season"]
